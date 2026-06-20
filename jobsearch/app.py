@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import cgi
+import concurrent.futures
 import datetime as dt
 import hashlib
 import html
@@ -152,7 +153,25 @@ def start_llm_bulk_rating_background(db_path: Path = DB_PATH, job_ids: Iterable[
         try:
             db = Database(db_path)
             db.init()
-            result = runner(db, normalized_job_ids) if runner else db.rate_jobs_with_llm(normalized_job_ids, force=force)
+
+            def progress_callback(event: dict[str, Any]) -> None:
+                with _BACKGROUND_LOCK:
+                    current = _BACKGROUND_JOBS.get(job_name, {})
+                    current.update({
+                        "requested": event.get("requested", len(normalized_job_ids)),
+                        "rated": event.get("rated", 0),
+                        "failed": event.get("failed", 0),
+                        "completed": event.get("completed", 0),
+                        "last_job_id": event.get("last_job_id"),
+                        "message": (
+                            f"LLM bulk rating running: {event.get('completed', 0)} of "
+                            f"{event.get('requested', len(normalized_job_ids))} completed; "
+                            f"rated {event.get('rated', 0)}, failed {event.get('failed', 0)}."
+                        ),
+                    })
+                    _BACKGROUND_JOBS[job_name] = current
+
+            result = runner(db, normalized_job_ids) if runner else db.rate_jobs_with_llm(normalized_job_ids, force=force, progress_callback=progress_callback)
             message = f"Rated {result.get('rated', 0)} of {result.get('requested', len(normalized_job_ids))} jobs with LLM. Failed: {result.get('failed', 0)}."
             status = "succeeded" if result.get("failed", 0) == 0 else "failed"
         except Exception as exc:
@@ -368,10 +387,17 @@ DEFAULT_LLM_MODEL = "gpt-4o-mini"
 REFERENCE_RUBRIC = """
 Rate jobs by expected interview probability plus role fit, not title similarity.
 Overall fit score uses 7 weighted areas: core job-function match 30%, experience/seniority 20%, domain 15%, technical/tool 15%, resume evidence 10%, gap severity 5%, strategic career value 5%.
-Score scale: 9.0-9.5 Excellent / Apply ASAP; 8.5-8.9 Strong fit; 8.0-8.4 Good stretch; 7.0-7.9 Medium stretch; 6.0-6.9 Reach; below 6.0 Skip or low priority.
+Score scale:
+- 9.0-9.5 Excellent / Apply ASAP: rare near-ideal fit, strong direct evidence, practical feasibility, and only minor gaps.
+- 8.5-8.9 Strong fit: credible interview target with strong evidence and manageable tailoring gaps.
+- 8.0-8.4 Good stretch: good adjacent fit with clear strengths but one or more meaningful gaps.
+- 7.0-7.9 Medium stretch: plausible but needs significant tailoring or has notable seniority/domain gaps.
+- 6.0-6.9 Reach: weak/uncertain fit; apply only if strategically interesting.
+- Below 6.0 Skip or low priority: wrong function, major blocker, or poor evidence fit.
 Strong evidence examples: Google Control Tower, Tesla warehouse optimization, Industrial Engineering + MS Data Science, Enron ML, Malema internship.
 High-value domains/tools: manufacturing, PCBA, supply chain, logistics, capacity, warehouse optimization, data analytics, SQL, Python, GCP, dashboards, optimization, ML, forecasting, BI tools, WMS/OMS.
 Separate skill fit from practical fit for internships, enrollment requirements, work authorization, language requirements, wrong seniority, or wrong function such as Java backend tech lead.
+Use the full scale: do not cap strong credible interview targets below 8.5 merely because they have manageable gaps; reserve 9.0+ for rare near-ideal matches.
 """.strip()
 
 
@@ -433,6 +459,20 @@ def normalize_llm_profile(profile: dict[str, Any]) -> dict[str, Any]:
     return normalized
 
 
+def rating_recommendation_for_score(score: float) -> str:
+    if score >= 9.0:
+        return "Apply ASAP"
+    if score >= 8.5:
+        return "Strong fit — worth applying"
+    if score >= 8.0:
+        return "Good stretch — apply if interested"
+    if score >= 7.0:
+        return "Medium stretch"
+    if score >= 6.0:
+        return "Reach"
+    return "Skip or very low priority"
+
+
 def normalize_llm_rating(rating: dict[str, Any]) -> dict[str, Any]:
     defaults: dict[str, Any] = {
         "overall_score": 0.0,
@@ -453,6 +493,12 @@ def normalize_llm_rating(rating: dict[str, Any]) -> dict[str, Any]:
             normalized[key] = float(normalized[key])
         except Exception:
             normalized[key] = 0.0
+    normalized["overall_score"] = max(1.0, min(9.5, normalized["overall_score"]))
+    normalized["skill_fit_score"] = max(0.0, min(9.5, normalized["skill_fit_score"]))
+    normalized["practical_fit_score"] = max(0.0, min(9.5, normalized["practical_fit_score"]))
+    band_recommendation = rating_recommendation_for_score(normalized["overall_score"])
+    normalized["recommendation"] = band_recommendation
+    normalized["apply_decision"] = band_recommendation
     return normalized
 
 
@@ -549,17 +595,7 @@ def _years_required(text: str) -> int | None:
 
 
 def _rating_recommendation(score: float) -> str:
-    if score >= 9.0:
-        return "Apply ASAP"
-    if score >= 8.5:
-        return "Strong fit — worth applying"
-    if score >= 8.0:
-        return "Good stretch — apply if interested"
-    if score >= 7.0:
-        return "Medium stretch"
-    if score >= 6.0:
-        return "Reach"
-    return "Skip or very low priority"
+    return rating_recommendation_for_score(score)
 
 
 def rate_job_fit(profile: dict[str, Any], job: NormalizedJob) -> dict[str, Any]:
@@ -1095,6 +1131,8 @@ REFERENCE 7-CATEGORY RUBRIC:
 
 Return JSON with keys: overall_score, skill_fit_score, practical_fit_score, recommendation, categories, strongest_evidence, main_gaps, practical_notes, resume_tailoring_notes, interview_probability_reasoning, apply_decision.
 Each category must include score, reason, matched_evidence, and gaps when applicable.
+Use category names aligned to the rubric when possible: core_job_function_match, experience_seniority_match, domain_match, technical_tool_match, resume_evidence_strength, gap_severity, strategic_career_value.
+Make the recommendation consistent with the numeric score band. Use 8.5+ for strong credible interview targets with manageable gaps; do not require a perfect match for 8.5-8.9.
 
 CANDIDATE PROFILE JSON:
 {json.dumps(profile, ensure_ascii=False)}
@@ -1129,16 +1167,77 @@ JOB JSON:
         llm_client=call_openai_compatible_json,
         model_name: str | None = None,
         force: bool = False,
+        max_workers: int | None = None,
+        progress_callback=None,
     ) -> dict[str, Any]:
         unique_job_ids = list(dict.fromkeys(int(job_id) for job_id in job_ids))
-        summary: dict[str, Any] = {"requested": len(unique_job_ids), "rated": 0, "failed": 0, "errors": []}
-        for job_id in unique_job_ids:
+        worker_count = max_workers if max_workers is not None else int(os.environ.get("JOBSEARCH_LLM_MAX_WORKERS", "4") or "4")
+        worker_count = max(1, min(int(worker_count), max(1, len(unique_job_ids)) if unique_job_ids else 1))
+        summary: dict[str, Any] = {
+            "requested": len(unique_job_ids),
+            "rated": 0,
+            "failed": 0,
+            "completed": 0,
+            "errors": [],
+            "max_workers": worker_count,
+            "last_job_id": None,
+        }
+        lock = threading.Lock()
+
+        def report(event: dict[str, Any]) -> None:
+            if progress_callback:
+                progress_callback(dict(event))
+
+        def update(status: str, job_id: int, error: str | None = None) -> None:
+            with lock:
+                summary["completed"] += 1
+                summary["last_job_id"] = job_id
+                if status in {"rated", "cached"}:
+                    summary["rated"] += 1
+                else:
+                    summary["failed"] += 1
+                    summary["errors"].append({"job_id": job_id, "error": error or "unknown error"})
+                event = {
+                    "status": status,
+                    "job_id": job_id,
+                    "requested": summary["requested"],
+                    "rated": summary["rated"],
+                    "failed": summary["failed"],
+                    "completed": summary["completed"],
+                    "last_job_id": summary["last_job_id"],
+                }
+            report(event)
+
+        def rate_one(job_id: int) -> tuple[int, str, str | None]:
+            worker_db = self if worker_count == 1 else Database(self.path)
             try:
-                self.rate_job_with_llm(job_id, llm_client=llm_client, model_name=model_name, force=force)
-                summary["rated"] += 1
+                before_id = None
+                if not force:
+                    latest = worker_db.latest_job_rating(job_id)
+                    before_id = latest["id"] if latest else None
+                row = worker_db.rate_job_with_llm(job_id, llm_client=llm_client, model_name=model_name, force=force)
+                status = "cached" if before_id is not None and row["id"] == before_id else "rated"
+                return job_id, status, None
             except Exception as exc:
-                summary["failed"] += 1
-                summary["errors"].append({"job_id": job_id, "error": str(exc)})
+                return job_id, "failed", str(exc)
+            finally:
+                if worker_db is not self:
+                    try:
+                        worker_db.conn.close()
+                    except Exception:
+                        pass
+
+        if worker_count == 1:
+            for job_id in unique_job_ids:
+                job_id, status, error = rate_one(job_id)
+                update(status, job_id, error)
+            return summary
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="llm-rating") as executor:
+            futures = [executor.submit(rate_one, job_id) for job_id in unique_job_ids]
+            for future in concurrent.futures.as_completed(futures):
+                job_id, status, error = future.result()
+                update(status, job_id, error)
         return summary
 
     def migrate_deprecated_statuses_to_new(self) -> None:

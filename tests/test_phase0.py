@@ -405,6 +405,82 @@ class Phase0Tests(unittest.TestCase):
             self.assertEqual(fake_llm.call_count, 2)
             self.assertEqual(db.conn.execute("SELECT COUNT(*) FROM job_ratings").fetchone()[0], 2)
 
+    def test_llm_rating_recommendation_is_normalized_to_score_band(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Database(Path(tmp) / "jobs.sqlite")
+            db.init()
+            db.upload_resume_file("resume.txt", b"SQL Python supply chain analytics", "text/plain")
+            db.extract_llm_profile_from_active_resumes(
+                MagicMock(return_value={"candidate_summary": "analytics", "target_roles": ["analyst"], "proof_points": []}),
+                model_name="test-model",
+            )
+            company = db.companies("databricks")[0]
+            _, _, ids = db.upsert_jobs(company, [NormalizedJob(
+                company_name="Databricks", source="manual", source_job_id="calibration-1", requisition_id=None,
+                title="Analytics Engineer", location="California", remote_type=None, department="Operations",
+                employment_type=None, salary_min=None, salary_max=None, currency=None, job_url="https://example.com/job/calibration",
+                apply_url="https://example.com/apply/calibration", description_raw_html="", description_text="SQL Python analytics",
+                posted_at=None,
+            )], refresh_mode="search")
+            fake_llm = MagicMock(return_value={
+                "overall_score": 8.3, "skill_fit_score": 8.5, "practical_fit_score": 8.0,
+                "recommendation": "Apply ASAP", "categories": {}, "strongest_evidence": ["SQL"],
+                "main_gaps": ["Minor seniority gap"], "practical_notes": [], "resume_tailoring_notes": [],
+                "interview_probability_reasoning": "Good but not excellent fit", "apply_decision": "Apply ASAP",
+            })
+
+            row = db.rate_job_with_llm(ids[0], fake_llm, model_name="test-model")
+            rating = json.loads(row["rating_json"])
+
+            self.assertEqual(row["overall_score"], 8.3)
+            self.assertEqual(row["recommendation"], "Good stretch — apply if interested")
+            self.assertEqual(rating["recommendation"], "Good stretch — apply if interested")
+            self.assertEqual(rating["apply_decision"], "Good stretch — apply if interested")
+
+    def test_bulk_llm_rating_uses_bounded_concurrency_and_reports_progress(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Database(Path(tmp) / "jobs.sqlite")
+            db.init()
+            db.upload_resume_file("resume.txt", b"SQL Python supply chain analytics", "text/plain")
+            db.extract_llm_profile_from_active_resumes(
+                MagicMock(return_value={"candidate_summary": "analytics", "target_roles": ["analyst"], "proof_points": []}),
+                model_name="test-model",
+            )
+            company = db.companies("databricks")[0]
+            jobs = [
+                NormalizedJob(
+                    company_name="Databricks", source="manual", source_job_id=f"fast-{i}", requisition_id=None,
+                    title=f"Data Analyst {i}", location="California", remote_type=None, department="Operations",
+                    employment_type=None, salary_min=None, salary_max=None, currency=None, job_url=f"https://example.com/fast/{i}",
+                    apply_url=f"https://example.com/apply/fast/{i}", description_raw_html="", description_text="SQL Python analytics",
+                    posted_at=None,
+                )
+                for i in range(4)
+            ]
+            _, _, ids = db.upsert_jobs(company, jobs, refresh_mode="search")
+            progress_events = []
+
+            def slow_llm(**_kwargs):
+                time.sleep(0.05)
+                return {
+                    "overall_score": 8.7, "skill_fit_score": 8.8, "practical_fit_score": 8.6,
+                    "recommendation": "Strong fit", "categories": {}, "strongest_evidence": ["SQL"],
+                    "main_gaps": [], "practical_notes": [], "resume_tailoring_notes": [],
+                    "interview_probability_reasoning": "Strong analytics fit", "apply_decision": "apply",
+                }
+
+            start = time.monotonic()
+            summary = db.rate_jobs_with_llm(ids, slow_llm, model_name="test-model", max_workers=4, progress_callback=progress_events.append)
+            elapsed = time.monotonic() - start
+
+            self.assertLess(elapsed, 0.15)
+            self.assertEqual(summary["requested"], 4)
+            self.assertEqual(summary["rated"], 4)
+            self.assertEqual(summary["failed"], 0)
+            self.assertEqual(summary["completed"], 4)
+            self.assertTrue(any(event["status"] == "rated" for event in progress_events))
+            self.assertEqual(db.conn.execute("SELECT COUNT(*) FROM job_ratings").fetchone()[0], 4)
+
     def test_query_job_ids_supports_all_matching_without_pagination_and_page_scope_uses_visible_rows(self):
         with tempfile.TemporaryDirectory() as tmp:
             db = Database(Path(tmp) / "jobs.sqlite")
