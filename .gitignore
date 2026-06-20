@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.env
+.DS_Store
+
+# Local runtime data: SQLite DB, logs, uploaded resumes, snapshots.
+data/
