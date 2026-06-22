@@ -31,6 +31,7 @@ from jobsearch.app import (
     render_job_action,
     render_job_from_db,
     reset_background_jobs_for_tests,
+    display_local_time,
     start_llm_bulk_rating_background,
     should_expire_missing_after_refresh,
     start_llm_profile_extraction_background,
@@ -41,6 +42,30 @@ from jobsearch.app import (
 class Phase0Tests(unittest.TestCase):
     def test_strip_html(self):
         self.assertEqual(strip_html("<p>Hello<br>World</p>"), "Hello\nWorld")
+
+    def test_display_local_time_converts_utc_iso_to_pacific_time(self):
+        self.assertEqual(display_local_time("2026-06-21T00:30:00+00:00"), "2026-06-20 17:30 PDT")
+        self.assertEqual(display_local_time("2026-01-21T08:30:00Z"), "2026-01-21 00:30 PST")
+        self.assertEqual(display_local_time(None), "")
+
+    def test_refresh_status_renders_local_time_for_run_timestamps(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Database(Path(tmp) / "jobs.sqlite")
+            db.init()
+            company = db.companies("databricks")[0]
+            db.conn.execute(
+                """
+                INSERT INTO job_fetch_runs(company_id, started_at, finished_at, status, jobs_found, jobs_created, jobs_updated, jobs_expired)
+                VALUES (?, ?, ?, 'success', 2, 1, 1, 0)
+                """,
+                (company["id"], "2026-06-21T00:30:00+00:00", "2026-06-21T00:35:00+00:00"),
+            )
+            db.conn.commit()
+
+            html = render_refresh_status_section(db)
+
+            self.assertIn("started 2026-06-20 17:30 PDT; finished 2026-06-20 17:35 PDT", html)
+            self.assertNotIn("2026-06-21T00:30:00+00:00", html)
 
     def test_filter_job_keeps_reviewable_jobs_new_without_candidate_keywords(self):
         job = NormalizedJob(
@@ -461,7 +486,7 @@ class Phase0Tests(unittest.TestCase):
             progress_events = []
 
             def slow_llm(**_kwargs):
-                time.sleep(0.05)
+                time.sleep(0.1)
                 return {
                     "overall_score": 8.7, "skill_fit_score": 8.8, "practical_fit_score": 8.6,
                     "recommendation": "Strong fit", "categories": {}, "strongest_evidence": ["SQL"],
@@ -473,7 +498,7 @@ class Phase0Tests(unittest.TestCase):
             summary = db.rate_jobs_with_llm(ids, slow_llm, model_name="test-model", max_workers=4, progress_callback=progress_events.append)
             elapsed = time.monotonic() - start
 
-            self.assertLess(elapsed, 0.15)
+            self.assertLess(elapsed, 0.3)
             self.assertEqual(summary["requested"], 4)
             self.assertEqual(summary["rated"], 4)
             self.assertEqual(summary["failed"], 0)

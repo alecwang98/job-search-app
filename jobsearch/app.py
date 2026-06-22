@@ -21,6 +21,7 @@ from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any, Iterable
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+from zoneinfo import ZoneInfo
 
 ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = ROOT / "data"
@@ -60,6 +61,23 @@ DEFAULT_HEADERS = {
 
 def now_iso() -> str:
     return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat()
+
+
+def display_local_time(value: Any, timezone_name: str | None = None) -> str:
+    """Format stored UTC-ish timestamps for local dashboard display without changing storage."""
+    if value is None or value == "":
+        return ""
+    raw = str(value).strip()
+    if not raw:
+        return ""
+    try:
+        parsed = dt.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return raw
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    local_zone = ZoneInfo(timezone_name or os.environ.get("JOBSEARCH_DISPLAY_TIMEZONE") or "America/Los_Angeles")
+    return parsed.astimezone(local_zone).strftime("%Y-%m-%d %H:%M %Z")
 
 
 def reset_background_jobs_for_tests() -> None:
@@ -1800,13 +1818,14 @@ def render_refresh_status_section(db: Database | None = None, limit: int = 6) ->
     for run in runs:
         status = run["status"]
         status_label = "✅ success" if status == "success" else ("❌ failed" if status == "error" else f"⏳ {status}")
-        finished = run["finished_at"] or "still running"
+        finished = display_local_time(run["finished_at"]) if run["finished_at"] else "still running"
+        started = display_local_time(run["started_at"])
         error_html = f'<p class=\"error\">Error: {esc(run["error_message"])}</p>' if run["error_message"] else ""
         items.append(
             f"""
             <li class=\"refresh-run status-{esc(status)}\">
               <strong>{esc(run['company_name'])}</strong>: {status_label}
-              <span class=\"meta\">started {esc(run['started_at'])}; finished {esc(finished)}</span>
+              <span class=\"meta\">started {esc(started)}; finished {esc(finished)}</span>
               <span class=\"meta\">found={esc(run['jobs_found'])} created={esc(run['jobs_created'])} updated={esc(run['jobs_updated'])} expired={esc(run['jobs_expired'])}</span>
               {error_html}
             </li>
@@ -2158,7 +2177,7 @@ def render_profile_section(db: Database | None = None) -> str:
               <p><strong>Technical skills:</strong> {esc(technical)}</p>
               <p><strong>Domain skills:</strong> {esc(domains)}</p>
               <p><strong>Weaknesses/gaps:</strong> {esc(gaps)}</p>
-              <p class="hint">Extractor: {esc(latest['extractor_version'])} · Model: {esc(latest['model_name'])} · Prompt: {esc(latest['prompt_version'])} · Created {esc(latest['created_at'])}</p>
+              <p class="hint">Extractor: {esc(latest['extractor_version'])} · Model: {esc(latest['model_name'])} · Prompt: {esc(latest['prompt_version'])} · Created {esc(display_local_time(latest['created_at']))}</p>
             """
             else:
                 skills = ", ".join(profile.get("skills", [])[:20]) or "No skills detected yet"
@@ -2173,13 +2192,13 @@ def render_profile_section(db: Database | None = None) -> str:
               <p><strong>Proof points:</strong> {esc(proof_points)}</p>
               <p><strong>Target directions:</strong> {esc(targets)}</p>
               <p><strong>Experience baseline:</strong> {esc(experience_baseline)}+ years</p>
-              <p class="hint">Extractor: {esc(latest['extractor_version'])} · Created {esc(latest['created_at'])}</p>
+              <p class="hint">Extractor: {esc(latest['extractor_version'])} · Created {esc(display_local_time(latest['created_at']))}</p>
             """
         if resumes:
             resume_items = "".join(
                 f"""
                 <li>
-                  {esc(row['original_filename'])} <span class="hint">({row['file_size']} bytes, uploaded {esc(row['uploaded_at'])})</span>
+                  {esc(row['original_filename'])} <span class="hint">({row['file_size']} bytes, uploaded {esc(display_local_time(row['uploaded_at']))})</span>
                   {'<span class="audit-badge">text extracted</span>' if row['extracted_text'] else ''}
                   {f'<span class="audit-badge">⚠ {esc(row["extraction_error"])}</span>' if row['extraction_error'] else ''}
                   <form class="inline" method="post" action="/resumes/{row['id']}/remove">
@@ -2247,7 +2266,7 @@ def render_rating_section(db: Database, job_id: int) -> str:
               <dt>Tailoring notes</dt><dd>{esc(tailoring)}</dd>
               <dt>Reasoning</dt><dd>{esc(data.get('interview_probability_reasoning', ''))}</dd>
             </dl>
-            <p class="hint">Rater: {esc(rating['rater_version'])} · Model: {esc(rating['model_name'])} · Created {esc(rating['created_at'])}</p>
+            <p class="hint">Rater: {esc(rating['rater_version'])} · Model: {esc(rating['model_name'])} · Created {esc(display_local_time(rating['created_at']))}</p>
           </section>
     """
 
@@ -2359,7 +2378,7 @@ def render_index(params: dict[str, list[str]]) -> str:
               {audit_badges(r)}
               {rating_badge}
               <p class="reason">{esc(r['filter_reason'])}</p>
-              <p class="dates">Found {esc(r['first_seen_at'])} · Last seen {esc(r['last_seen_at'])}</p>
+              <p class="dates">Found {esc(display_local_time(r['first_seen_at']))} · Last seen {esc(display_local_time(r['last_seen_at']))}</p>
               <a class="button" href="/jobs/{r['id']}/open" target="_blank" rel="noopener">Open official job</a>
               {job_action}
             </article>
@@ -2512,8 +2531,8 @@ def render_job_from_db(db: Database, job_id: int) -> str:
             <dt>Source job ID</dt><dd>{esc(r['source_job_id'])}</dd>
             <dt>Requisition ID</dt><dd>{esc(r['requisition_id'])}</dd>
             <dt>Filter reason</dt><dd>{esc(r['filter_reason'])}</dd>
-            <dt>First seen</dt><dd>{esc(r['first_seen_at'])}</dd>
-            <dt>Last seen</dt><dd>{esc(r['last_seen_at'])}</dd>
+            <dt>First seen</dt><dd>{esc(display_local_time(r['first_seen_at']))}</dd>
+            <dt>Last seen</dt><dd>{esc(display_local_time(r['last_seen_at']))}</dd>
           </dl>
           {render_audit_section(r)}
           {rating_section}

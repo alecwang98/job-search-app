@@ -114,7 +114,7 @@ The refresh command supports two modes:
 
 Fast mode was intentionally removed because lightweight listing-only records are not useful enough for fit review without full descriptions, and search mode is a clearer way to limit the job set. Only an unrestricted full refresh may mark unseen jobs as expired; limited and search refreshes are intentionally partial and must not expire jobs that are outside the fetched subset.
 
-A daily full refresh should be scheduled at 12:00 AM using the host scheduler/Hermes cron rather than hidden browser automation. The dashboard must make scheduled refreshes observable by showing the most recent refresh status per company from `job_fetch_runs`, including whether it succeeded or failed, start/finish timestamps, counts found/created/updated/expired, and any error message. Manual refreshes may use the same status surface because both scheduled and manual refreshes write to `job_fetch_runs`.
+A daily full refresh should be scheduled at 12:00 AM using the host scheduler/Hermes cron rather than hidden browser automation. The dashboard must make scheduled refreshes observable by showing the most recent refresh status per company from `job_fetch_runs`, including whether it succeeded or failed, start/finish timestamps displayed in local Pacific time for readability, counts found/created/updated/expired, and any error message. Manual refreshes may use the same status surface because both scheduled and manual refreshes write to `job_fetch_runs`. Persisted timestamps remain UTC/ISO strings; local-time conversion is display-only.
 
 ## 5. Data Storage
 
