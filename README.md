@@ -25,6 +25,40 @@ Primary docs:
 
 The Markdown BRDs are the canonical editable docs. Matching `.docx` exports are kept in `docs/brd/` for archival/sharing.
 
+Fresh setup tutorial: `docs/setup-tutorial.md`.
+
+## Fresh setup
+
+Clone and create a local Python environment:
+
+```bash
+git clone https://github.com/alecwang98/job-search-app.git
+cd job-search-app
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+```
+
+Initialize a new local database, fetch a small sample, and start the dashboard:
+
+```bash
+python -m jobsearch.app init-db
+python -m jobsearch.app refresh --limit 10
+python -m jobsearch.app serve --port 8787
+```
+
+Then open `http://127.0.0.1:8787`.
+
+Runtime data is intentionally local-only and not included in Git. A fresh clone creates its own `data/jobs.sqlite`; the committed repo does not include databases, uploaded resumes, logs, raw snapshots, or `.env` secrets.
+
+Optional setup:
+
+- PDF resume extraction: included through `PyMuPDF` in `requirements.txt`.
+- Tests/development: `python -m pip install -r requirements-dev.txt`, then `python -m pytest`.
+- LLM profile extraction/rating: copy `.env.example` to `.env` and set `JOBSEARCH_LLM_API_KEY` plus optional OpenAI-compatible provider settings.
+- Scheduled refresh: not built into new clones. Create your own OS/Hermes cron if desired; see `docs/setup-tutorial.md`.
+
 ## Commands
 
 Initialize database:
@@ -119,4 +153,4 @@ Connectors use a standard list/detail contract:
 - Greenhouse/Databricks: `fetch_list()` already receives full descriptions from `content=true`, so `fetch_detail_if_needed()` is a no-op.
 - Workday/NVIDIA: `fetch_list()` receives lightweight listing rows, then `fetch_detail_if_needed()` calls the Workday detail endpoint for each listing so saved jobs are review-ready with full descriptions.
 
-The NVIDIA full refresh can be slower because Workday returns listings first and the app fetches detail records for descriptions. Daily background refresh is a future option, but is intentionally not scheduled yet.
+The NVIDIA full refresh can be slower because Workday returns listings first and the app fetches detail records for descriptions. New clones do not include any automatic scheduler; use an external OS/Hermes cron only if you want scheduled refreshes.

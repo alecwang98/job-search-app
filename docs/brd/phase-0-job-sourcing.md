@@ -23,10 +23,20 @@ Repository layout:
 
 - `jobsearch/app.py`: single-file Python app containing environment loading, background jobs, connectors, SQLite migrations/data access, resume/profile/rating logic, dashboard rendering, HTTP handlers, and CLI commands.
 - `tests/test_phase0.py`: regression tests for ingestion, DB state transitions, dashboard rendering, LLM profile/rating flows, fast/deep rating, and model comparison helpers.
+- `requirements.txt`: runtime dependencies for optional PDF resume extraction.
+- `requirements-dev.txt`: test/development dependencies.
+- `docs/setup-tutorial.md`: fresh-clone setup, local database initialization, optional LLM setup, optional scheduled refresh guidance, and Git/data boundary notes.
 - `data/jobs.sqlite`: local SQLite database.
 - `data/resumes/`: uploaded resume files.
 - `docs/brd/`: markdown and Word BRDs.
 - `.env`: gitignored local secrets/config. `.env.example` documents required variables.
+
+Distribution/setup notes:
+
+- The Git repository intentionally does not include `data/`, local SQLite databases, uploaded resumes, raw snapshots, logs, or `.env` secrets.
+- A new clone must create its own Python environment, install `requirements.txt`, run `python -m jobsearch.app init-db`, and then run a refresh to populate `data/jobs.sqlite`.
+- LLM features require a user-owned OpenAI-compatible API key in local `.env` or the process environment.
+- Scheduled refreshes are external to the repository. The original local machine used a Hermes cron script outside the repo, but new clones do not get any automatic scheduler.
 
 Live local database state as of latest inspection on 2026-09-14:
 
