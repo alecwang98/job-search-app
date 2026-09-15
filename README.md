@@ -4,7 +4,9 @@ Local-first app for finding and reviewing suitable jobs.
 
 ## Current status
 
-Phase 0 MVP is implemented:
+**Paused / maintenance-only as of 2026-09-14.** The job search that motivated this app is complete, so active feature development is paused. Keep this repository as a working local-first checkpoint: useful for future job searches, reference, or resuming development later.
+
+Implemented capabilities:
 
 - Databricks connector via Greenhouse API
 - NVIDIA connector via Workday CXS API
@@ -12,8 +14,16 @@ Phase 0 MVP is implemented:
 - Basic target-role/location filtering
 - Fetch run logging
 - Local dashboard for browsing jobs
+- Resume upload/profile extraction
+- Manual and bulk LLM job rating
+- Fast/deep rating comparison CLIs
 
-See the BRD: `docs/brd/phase-0-job-sourcing.md`.
+Primary docs:
+
+- Phase 0/current app BRD: `docs/brd/phase-0-job-sourcing.md`
+- Phase 1 rating-quality/speed BRD: `docs/brd/phase-1-llm-rating-quality-speed.md`
+
+The Markdown BRDs are the canonical editable docs. Matching `.docx` exports are kept in `docs/brd/` for archival/sharing.
 
 ## Commands
 

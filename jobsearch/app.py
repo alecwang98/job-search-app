@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import cgi
 import concurrent.futures
 import datetime as dt
 import hashlib
@@ -12,12 +11,15 @@ import re
 import sqlite3
 import sys
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, asdict
+from email.parser import BytesParser
+from email.policy import default as EMAIL_POLICY
 from pathlib import Path
 from typing import Any, Iterable
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
@@ -28,6 +30,7 @@ DATA_DIR = ROOT / "data"
 DB_PATH = DATA_DIR / "jobs.sqlite"
 RESUME_DIR = DATA_DIR / "resumes"
 ENV_PATH = ROOT / ".env"
+HERMES_ENV_PATH = Path(os.environ.get("HERMES_HOME") or (Path.home() / ".hermes")) / ".env"
 
 
 def load_local_env(path: Path = ENV_PATH) -> None:
@@ -48,7 +51,41 @@ def load_local_env(path: Path = ENV_PATH) -> None:
         os.environ[key] = value
 
 
-load_local_env()
+def load_environment_files(root_env: Path = ENV_PATH, hermes_env: Path = HERMES_ENV_PATH) -> None:
+    """Load project .env first, then Hermes .env as a fallback for missing shared keys."""
+    load_local_env(root_env)
+    load_local_env(hermes_env)
+
+
+def parse_multipart_file_field(content_type: str, body: bytes, field_name: str) -> dict[str, Any] | None:
+    """Parse one multipart/form-data file field without the removed stdlib cgi module."""
+    if not content_type or "multipart/form-data" not in content_type.lower():
+        return None
+    raw_message = (
+        f"Content-Type: {content_type}\r\n"
+        "MIME-Version: 1.0\r\n"
+        "\r\n"
+    ).encode("utf-8") + body
+    message = BytesParser(policy=EMAIL_POLICY).parsebytes(raw_message)
+    if not message.is_multipart():
+        return None
+    for part in message.iter_parts():
+        if part.get_content_disposition() != "form-data":
+            continue
+        if part.get_param("name", header="content-disposition") != field_name:
+            continue
+        filename = part.get_filename()
+        if not filename:
+            return None
+        return {
+            "filename": filename,
+            "content": part.get_payload(decode=True) or b"",
+            "content_type": part.get_content_type(),
+        }
+    return None
+
+
+load_environment_files()
 
 _BACKGROUND_LOCK = threading.Lock()
 _BACKGROUND_JOBS: dict[str, dict[str, Any]] = {}
@@ -216,6 +253,56 @@ def start_llm_bulk_rating_background(db_path: Path = DB_PATH, job_ids: Iterable[
     return background_job_snapshot(job_name) or job
 
 
+def start_llm_fast_rating_background(db_path: Path = DB_PATH, job_ids: Iterable[int] = (), runner=None, force: bool = False) -> dict[str, Any]:
+    """Start bulk fast LLM pre-rating in a background thread and return immediately."""
+    normalized_job_ids = list(dict.fromkeys(int(job_id) for job_id in job_ids))
+    job_name = "llm_fast_rating"
+    with _BACKGROUND_LOCK:
+        existing = _BACKGROUND_JOBS.get(job_name)
+        if existing and existing.get("status") == "running":
+            return dict(existing)
+        job = {
+            "name": job_name,
+            "status": "running",
+            "message": f"Fast LLM rating is running in the background for {len(normalized_job_ids)} jobs.",
+            "started_at": now_iso(),
+            "finished_at": None,
+            "requested": len(normalized_job_ids),
+        }
+        _BACKGROUND_JOBS[job_name] = job
+
+    def run() -> None:
+        db = None
+        try:
+            db = Database(db_path)
+            db.init()
+            result = runner(db, normalized_job_ids) if runner else db.fast_rate_jobs_with_llm(normalized_job_ids, force=force)
+            message = f"Fast-rated {result.get('rated', 0)} of {result.get('requested', len(normalized_job_ids))} jobs. Failed: {result.get('failed', 0)}."
+            status = "succeeded" if result.get("failed", 0) == 0 else "failed"
+        except Exception as exc:
+            if db is not None:
+                try:
+                    db.conn.rollback()
+                except Exception:
+                    pass
+            message = f"Fast LLM rating failed: {exc}"
+            status = "failed"
+        finally:
+            if db is not None:
+                try:
+                    db.conn.close()
+                except Exception:
+                    pass
+        with _BACKGROUND_LOCK:
+            current = _BACKGROUND_JOBS.get(job_name, {})
+            current.update({"status": status, "message": message, "finished_at": now_iso()})
+            _BACKGROUND_JOBS[job_name] = current
+
+    thread = threading.Thread(target=run, name="llm-fast-rating", daemon=True)
+    thread.start()
+    return background_job_snapshot(job_name) or job
+
+
 def strip_html(value: str | None) -> str:
     if not value:
         return ""
@@ -361,32 +448,11 @@ def build_ingestion_audit(job: NormalizedJob) -> dict[str, Any]:
     }
 
 
-PROFILE_SKILL_TERMS = [
-    "python", "sql", "machine learning", "ml", "data pipeline", "data pipelines", "docker",
-    "kubernetes", "aws", "gcp", "azure", "pytorch", "tensorflow", "javascript", "typescript",
-    "react", "node", "java", "c++", "spark", "databricks", "airflow", "etl", "llm", "rag",
-    "dashboard", "dashboards", "optimization", "mixed-integer optimization", "forecasting", "bi tools",
-    "wms", "oms", "kpi", "capacity planning", "network optimization", "sku allocation",
-]
-
-PROFILE_DOMAIN_TERMS = [
-    "backend", "data engineering", "machine learning", "mlops", "infrastructure", "frontend",
-    "full stack", "analytics", "data analytics", "ai", "platform", "automation", "supply chain",
-    "logistics", "manufacturing", "pcba", "capacity", "warehouse optimization", "warehouse",
-    "operations", "planning", "sourcing", "quality", "process improvement", "lean six sigma",
-]
-
-PROFILE_TARGET_DIRECTIONS = [
-    "tech supply chain", "tpm", "analytics", "infrastructure", "china/us/global exposure", "management track",
-]
-
-PROFILE_PROOF_POINT_PATTERNS = {
-    "google_control_tower": ["google control tower", "control tower", "contract manufacturing", "oee", "wip", "production risk"],
-    "tesla_warehouse_optimization": ["tesla", "warehouse optimization", "historical picks", "mixed-integer optimization", "pick-time", "pick time"],
-    "ms_data_science": ["ms data science", "master of science in data science", "m.s. data science", "msds"],
-    "industrial_engineering": ["industrial engineering"],
-    "enron_ml": ["enron", "enron ml"],
-    "malema_internship": ["malema", "lean six sigma", "5s", "calibration automation"],
+LOCAL_PROFILE_STOPWORDS = {
+    "about", "above", "across", "after", "again", "against", "also", "among", "because", "before", "being",
+    "below", "between", "both", "built", "could", "during", "each", "from", "have", "into", "more",
+    "most", "other", "over", "resume", "should", "than", "that", "their", "there", "these", "this", "through",
+    "under", "using", "with", "within", "without", "work", "worked", "years",
 }
 
 RATING_WEIGHTS = {
@@ -401,7 +467,10 @@ RATING_WEIGHTS = {
 
 PROFILE_PROMPT_VERSION = "llm-profile-v1"
 RATING_PROMPT_VERSION = "llm-rating-v1"
+FAST_RATING_PROMPT_VERSION = "llm-fast-rating-v5"
 DEFAULT_LLM_MODEL = "gpt-4o-mini"
+DEEPSEEK_V4_FLASH_OPENROUTER_MODEL = "deepseek/deepseek-v4-flash"
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 REFERENCE_RUBRIC = """
 Rate jobs by expected interview probability plus role fit, not title similarity.
 Overall fit score uses 7 weighted areas: core job-function match 30%, experience/seniority 20%, domain 15%, technical/tool 15%, resume evidence 10%, gap severity 5%, strategic career value 5%.
@@ -412,9 +481,8 @@ Score scale:
 - 7.0-7.9 Medium stretch: plausible but needs significant tailoring or has notable seniority/domain gaps.
 - 6.0-6.9 Reach: weak/uncertain fit; apply only if strategically interesting.
 - Below 6.0 Skip or low priority: wrong function, major blocker, or poor evidence fit.
-Strong evidence examples: Google Control Tower, Tesla warehouse optimization, Industrial Engineering + MS Data Science, Enron ML, Malema internship.
-High-value domains/tools: manufacturing, PCBA, supply chain, logistics, capacity, warehouse optimization, data analytics, SQL, Python, GCP, dashboards, optimization, ML, forecasting, BI tools, WMS/OMS.
-Separate skill fit from practical fit for internships, enrollment requirements, work authorization, language requirements, wrong seniority, or wrong function such as Java backend tech lead.
+Use only evidence, target roles, skills, domains, proof points, gaps, and practical constraints contained in the current extracted profile JSON. Do not introduce candidate-specific examples, assumed industries, assumed companies, assumed tools, or hidden keyword lists outside that profile.
+Separate skill fit from practical fit for constraints explicitly present in the job and/or extracted profile, such as eligibility, location/work authorization, language requirements, years/seniority mismatch, or function mismatch.
 Use the full scale: do not cap strong credible interview targets below 8.5 merely because they have manageable gaps; reserve 9.0+ for rare near-ideal matches.
 """.strip()
 
@@ -423,14 +491,20 @@ def configured_llm_model() -> str:
     return os.environ.get("JOBSEARCH_LLM_MODEL") or os.environ.get("OPENAI_MODEL") or DEFAULT_LLM_MODEL
 
 
-def call_openai_compatible_json(system_prompt: str, user_prompt: str, model_name: str | None = None) -> dict[str, Any]:
+def call_openai_compatible_json(
+    system_prompt: str,
+    user_prompt: str,
+    model_name: str | None = None,
+    api_key: str | None = None,
+    base_url: str | None = None,
+) -> dict[str, Any]:
     """Call an OpenAI-compatible chat-completions endpoint and return parsed JSON."""
-    api_key = os.environ.get("JOBSEARCH_LLM_API_KEY") or os.environ.get("OPENAI_API_KEY")
-    if not api_key:
+    resolved_api_key = api_key or os.environ.get("JOBSEARCH_LLM_API_KEY") or os.environ.get("OPENAI_API_KEY")
+    if not resolved_api_key:
         raise RuntimeError("Set JOBSEARCH_LLM_API_KEY or OPENAI_API_KEY before using LLM extraction/rating.")
     model = model_name or configured_llm_model()
-    base_url = os.environ.get("JOBSEARCH_LLM_BASE_URL") or os.environ.get("OPENAI_BASE_URL") or "https://api.openai.com/v1"
-    url = base_url.rstrip("/") + "/chat/completions"
+    resolved_base_url = base_url or os.environ.get("JOBSEARCH_LLM_BASE_URL") or os.environ.get("OPENAI_BASE_URL") or "https://api.openai.com/v1"
+    url = resolved_base_url.rstrip("/") + "/chat/completions"
     payload = {
         "model": model,
         "messages": [
@@ -443,7 +517,7 @@ def call_openai_compatible_json(system_prompt: str, user_prompt: str, model_name
     req = urllib.request.Request(
         url,
         data=json.dumps(payload).encode("utf-8"),
-        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        headers={"Authorization": f"Bearer {resolved_api_key}", "Content-Type": "application/json"},
         method="POST",
     )
     try:
@@ -457,6 +531,36 @@ def call_openai_compatible_json(system_prompt: str, user_prompt: str, model_name
     if not isinstance(parsed, dict):
         raise RuntimeError("LLM response was not a JSON object.")
     return parsed
+
+
+def deepseek_v4_flash_openrouter_client(system_prompt: str, user_prompt: str, model_name: str | None = None) -> dict[str, Any]:
+    """Call DeepSeek v4 Flash through OpenRouter for fast-rating benchmarks."""
+    api_key = os.environ.get("OPENROUTER_API_KEY")
+    if not api_key:
+        raise RuntimeError("Set OPENROUTER_API_KEY before using --fast-mode openrouter-v4-flash.")
+    return call_openai_compatible_json(
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        model_name=model_name or DEEPSEEK_V4_FLASH_OPENROUTER_MODEL,
+        api_key=api_key,
+        base_url=OPENROUTER_BASE_URL,
+    )
+
+
+def fast_llm_client_for_mode(mode: str):
+    if mode == "default":
+        return call_openai_compatible_json
+    if mode == "openrouter-v4-flash":
+        return deepseek_v4_flash_openrouter_client
+    raise ValueError(f"Unknown fast LLM mode: {mode}")
+
+
+def fast_model_name_for_mode(mode: str, model_name: str | None = None) -> str | None:
+    if model_name:
+        return model_name
+    if mode == "openrouter-v4-flash":
+        return DEEPSEEK_V4_FLASH_OPENROUTER_MODEL
+    return None
 
 
 def normalize_llm_profile(profile: dict[str, Any]) -> dict[str, Any]:
@@ -520,6 +624,31 @@ def normalize_llm_rating(rating: dict[str, Any]) -> dict[str, Any]:
     return normalized
 
 
+def fast_rating_bucket_label(bucket: str | None) -> str:
+    return {
+        "gte_7": ">=7 fast pass",
+        "lt_7": "<7 fast skip",
+        "needs_manual_review": "Needs manual review",
+    }.get(str(bucket or ""), "Unrated")
+
+
+def normalize_fast_rating(rating: dict[str, Any]) -> dict[str, Any]:
+    normalized = {
+        "bucket": str((rating or {}).get("bucket") or "needs_manual_review"),
+        "confidence": str((rating or {}).get("confidence") or "low"),
+        "reason_codes": (rating or {}).get("reason_codes") or [],
+        "short_reason": str((rating or {}).get("short_reason") or ""),
+    }
+    if normalized["bucket"] not in {"gte_7", "lt_7", "needs_manual_review"}:
+        normalized["bucket"] = "needs_manual_review"
+    if normalized["confidence"] not in {"low", "medium", "high"}:
+        normalized["confidence"] = "low"
+    if not isinstance(normalized["reason_codes"], list):
+        normalized["reason_codes"] = [str(normalized["reason_codes"])]
+    normalized["reason_codes"] = [str(item) for item in normalized["reason_codes"][:8]]
+    return normalized
+
+
 def sanitize_filename(filename: str) -> str:
     name = Path(filename or "resume.txt").name.strip() or "resume.txt"
     return re.sub(r"[^A-Za-z0-9._-]+", "_", name)[:160]
@@ -562,29 +691,43 @@ def extract_resume_text(path: Path) -> str:
     raise ValueError(f"Unsupported resume file type: {suffix or 'unknown'}")
 
 
+def _keyword_phrases_from_text(text: str, limit: int = 30) -> list[str]:
+    """Extract generic, resume-derived keyword phrases without candidate-specific dictionaries."""
+    tokens = [token.lower() for token in re.findall(r"[A-Za-z][A-Za-z0-9+.#-]{2,}", text)]
+    counts: dict[str, int] = {}
+    for token in tokens:
+        if token in LOCAL_PROFILE_STOPWORDS:
+            continue
+        counts[token] = counts.get(token, 0) + 1
+    phrases: dict[str, int] = dict(counts)
+    for left, right in zip(tokens, tokens[1:]):
+        if left in LOCAL_PROFILE_STOPWORDS or right in LOCAL_PROFILE_STOPWORDS:
+            continue
+        phrases[f"{left} {right}"] = phrases.get(f"{left} {right}", 0) + 2
+    return sorted(phrases, key=lambda item: (-phrases[item], item))[:limit]
+
+
 def build_profile_from_texts(resume_texts: list[str]) -> dict[str, Any]:
+    """Build a generic local/debug profile only from resume text.
+
+    This fallback intentionally avoids hardcoded candidate roles, domains, companies,
+    technologies, proof-point names, or target directions. The production dashboard path
+    uses LLM extraction; this helper exists for tests/debugging when no model call is made.
+    """
     combined = "\n\n".join(text for text in resume_texts if text).strip()
-    lower = combined.lower()
-    skills = sorted({term for term in PROFILE_SKILL_TERMS if term in lower})
-    domains = sorted({term for term in PROFILE_DOMAIN_TERMS if term in lower})
     years = sorted(set(re.findall(r"\b(?:19|20)\d{2}\b|\b\d+\+?\s+years?\b", combined, flags=re.I)))[:20]
     numeric_years = [int(match) for match in re.findall(r"\b(\d+)\+?\s+years?\b", combined, flags=re.I)]
-    baseline_years = max([3, *numeric_years]) if combined else 0
-    proof_points = sorted(
-        key
-        for key, patterns in PROFILE_PROOF_POINT_PATTERNS.items()
-        if any(pattern in lower for pattern in patterns)
-    )
+    baseline_years = max(numeric_years) if numeric_years else 0
     lines = [line.strip() for line in combined.splitlines() if line.strip()]
-    highlights = lines[:12]
+    keywords = _keyword_phrases_from_text(combined)
     return {
-        "skills": skills,
-        "domains": domains,
+        "skills": keywords,
+        "domains": [],
         "experience_signals": years,
         "baseline_years_experience": baseline_years,
-        "proof_points": proof_points,
-        "target_directions": PROFILE_TARGET_DIRECTIONS,
-        "highlights": highlights,
+        "proof_points": [],
+        "target_directions": [],
+        "highlights": lines[:12],
         "summary": " ".join(lines[:4])[:1000],
         "source_text_characters": len(combined),
     }
@@ -597,8 +740,65 @@ def _text_for_job(job: NormalizedJob) -> str:
     ).lower()
 
 
+def _flatten_profile_strings(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        flattened: list[str] = []
+        for key, nested in value.items():
+            if isinstance(key, str):
+                flattened.append(key)
+            flattened.extend(_flatten_profile_strings(nested))
+        return flattened
+    if isinstance(value, (list, tuple, set)):
+        flattened = []
+        for item in value:
+            flattened.extend(_flatten_profile_strings(item))
+        return flattened
+    return [str(value)]
+
+
+def _profile_terms(profile: dict[str, Any], *keys: str) -> list[str]:
+    terms: list[str] = []
+    for key in keys:
+        terms.extend(_flatten_profile_strings(profile.get(key)))
+    seen: set[str] = set()
+    result: list[str] = []
+    for term in terms:
+        cleaned = re.sub(r"\s+", " ", str(term)).strip()
+        if len(cleaned) < 3:
+            continue
+        lowered = cleaned.lower()
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        result.append(cleaned)
+    return result
+
+
 def _matched_terms(terms: Iterable[str], text: str) -> list[str]:
-    return sorted({term for term in terms if term and term.lower() in text})
+    lowered = text.lower()
+    return sorted({term for term in terms if term and term.lower() in lowered})
+
+
+def _term_tokens(term: str) -> set[str]:
+    return {
+        token.lower()
+        for token in re.findall(r"[A-Za-z][A-Za-z0-9+.#-]{2,}", term)
+        if token.lower() not in LOCAL_PROFILE_STOPWORDS
+    }
+
+
+def _overlap_matches(candidate_terms: Iterable[str], job_text: str, min_overlap: int = 1) -> list[str]:
+    job_tokens = _term_tokens(job_text)
+    matches = []
+    for term in candidate_terms:
+        tokens = _term_tokens(term)
+        if tokens and len(tokens & job_tokens) >= min_overlap:
+            matches.append(term)
+    return sorted(set(matches))
 
 
 def _score_from_match_count(count: int, strong: int = 4, base: float = 2.0) -> float:
@@ -612,85 +812,67 @@ def _years_required(text: str) -> int | None:
     return max(matches) if matches else None
 
 
+def _profile_years(profile: dict[str, Any]) -> int:
+    seniority = profile.get("seniority") if isinstance(profile.get("seniority"), dict) else {}
+    candidates = [
+        profile.get("baseline_years_experience"),
+        seniority.get("years_experience") if isinstance(seniority, dict) else None,
+    ]
+    for candidate in candidates:
+        try:
+            if candidate is not None:
+                return int(float(candidate))
+        except Exception:
+            continue
+    return 0
+
+
 def _rating_recommendation(score: float) -> str:
     return rating_recommendation_for_score(score)
 
 
 def rate_job_fit(profile: dict[str, Any], job: NormalizedJob) -> dict[str, Any]:
-    """Rate a job with the user's 7-category interview-probability + role-fit rubric.
-
-    This is intentionally deterministic/local for the first implementation. It returns a
-    stable structure that can later be swapped to an LLM scorer while preserving UI/DB shape.
-    """
+    """Deterministic/debug fit rating derived only from the supplied profile JSON."""
     text = _text_for_job(job)
-    profile_skills = [str(item) for item in profile.get("skills", [])]
-    profile_domains = [str(item) for item in profile.get("domains", [])]
-    proof_points = [str(item) for item in profile.get("proof_points", [])]
-    target_directions = [str(item) for item in profile.get("target_directions", PROFILE_TARGET_DIRECTIONS)]
+    target_terms = _profile_terms(profile, "target_roles", "target_directions")
+    skill_terms = _profile_terms(profile, "technical_skills", "skills", "core_strengths")
+    domain_terms = _profile_terms(profile, "target_industries", "domain_skills", "domains")
+    proof_terms = _profile_terms(profile, "proof_points", "resume_bullet_inventory", "highlights")
+    gap_terms = _profile_terms(profile, "weaknesses_or_gaps", "practical_constraints")
 
-    function_terms = [
-        "analytics", "analyst", "planning", "capacity", "tpm", "program manager", "sourcing",
-        "logistics", "supply chain", "operations", "warehouse", "optimization", "network optimization",
-        "sku allocation", "forecasting", "machine learning", "ml", "data", "dashboard",
-    ]
-    wrong_function_terms = ["java backend", "backend engineering", "microservices", "system architecture", "production software development"]
-    hard_blocker_terms = [
-        "japanese fluency", "japanese required", "uk work authorization", "work authorization required",
-        "current enrollment", "currently enrolled", "internship", "10 years", "java backend", "production software development",
-    ]
-
-    matched_functions = _matched_terms(function_terms, text)
-    wrong_functions = _matched_terms(wrong_function_terms, text)
-    matched_domains = _matched_terms(profile_domains, text)
-    matched_skills = _matched_terms(profile_skills, text)
-    matched_targets = _matched_terms(target_directions, text)
-    gaps = _matched_terms(hard_blocker_terms, text) + [f"Wrong core function: {term}" for term in wrong_functions]
+    matched_targets = _matched_terms(target_terms, text)
+    matched_skills = _matched_terms(skill_terms, text)
+    matched_domains = _matched_terms(domain_terms, text)
+    evidence = _overlap_matches(proof_terms, text, min_overlap=2)
+    gaps = _matched_terms(gap_terms, text)
 
     required_years = _years_required(text)
-    baseline_years = int(profile.get("baseline_years_experience") or 3)
-    if required_years is None:
+    baseline_years = _profile_years(profile)
+    if required_years is None or baseline_years <= 0:
         exp_score = 8.0
     elif required_years <= baseline_years + 1:
         exp_score = 9.0
     elif required_years <= baseline_years + 3:
         exp_score = 6.0
-        gaps.append(f"Requires {required_years}+ years vs current {baseline_years}+ profile")
+        gaps.append(f"Requires {required_years}+ years vs extracted profile {baseline_years}+ years")
     else:
         exp_score = 3.5
-        gaps.append(f"Requires {required_years}+ years vs current {baseline_years}+ profile")
+        gaps.append(f"Requires {required_years}+ years vs extracted profile {baseline_years}+ years")
 
-    core_score = _score_from_match_count(len(matched_functions), strong=5, base=2.0)
-    if wrong_functions and len(matched_functions) < 4:
-        core_score = min(core_score, 4.0)
+    core_score = max(
+        _score_from_match_count(len(matched_targets), strong=2, base=2.0),
+        _score_from_match_count(len(matched_skills) + len(matched_domains), strong=5, base=2.0),
+    )
     domain_score = _score_from_match_count(len(matched_domains), strong=4, base=2.0)
     tech_score = _score_from_match_count(len(matched_skills), strong=5, base=2.0)
-
-    evidence = []
-    if any(term in text for term in ["capacity", "supply chain", "manufacturing", "dashboard", "oee", "wip"]):
-        if "google_control_tower" in proof_points:
-            evidence.append("google_control_tower")
-    if any(term in text for term in ["warehouse", "optimization", "network optimization", "sku allocation"]):
-        if "tesla_warehouse_optimization" in proof_points:
-            evidence.append("tesla_warehouse_optimization")
-    if any(term in text for term in ["machine learning", "ml", "data", "analytics", "forecasting"]):
-        for proof in ["ms_data_science", "industrial_engineering", "enron_ml"]:
-            if proof in proof_points:
-                evidence.append(proof)
-    if any(term in text for term in ["quality", "process", "sop", "lean", "5s"]):
-        if "malema_internship" in proof_points:
-            evidence.append("malema_internship")
-    evidence = sorted(set(evidence))
     evidence_score = _score_from_match_count(len(evidence), strong=3, base=1.5)
-
-    gap_score = 9.0 if not gaps else max(1.0, 9.0 - 2.5 * len(set(gaps)))
+    gap_score = 9.0 if not gaps else max(1.0, 9.0 - 2.0 * len(set(gaps)))
     strategic_score = _score_from_match_count(len(matched_targets), strong=2, base=5.0)
-    if not matched_targets and matched_domains:
-        strategic_score = 8.0
-    if wrong_functions and not matched_domains:
-        strategic_score = min(strategic_score, 4.0)
+    if not matched_targets and (matched_domains or matched_skills):
+        strategic_score = 7.0
 
     categories = {
-        "core_job_function_match": {"weight": RATING_WEIGHTS["core_job_function_match"], "score": round(core_score, 1), "matches": matched_functions},
+        "core_job_function_match": {"weight": RATING_WEIGHTS["core_job_function_match"], "score": round(core_score, 1), "matches": matched_targets or matched_skills[:5]},
         "experience_seniority_match": {"weight": RATING_WEIGHTS["experience_seniority_match"], "score": round(exp_score, 1), "required_years": required_years, "baseline_years": baseline_years},
         "domain_match": {"weight": RATING_WEIGHTS["domain_match"], "score": round(domain_score, 1), "matches": matched_domains},
         "technical_tool_match": {"weight": RATING_WEIGHTS["technical_tool_match"], "score": round(tech_score, 1), "matches": matched_skills},
@@ -699,11 +881,7 @@ def rate_job_fit(profile: dict[str, Any], job: NormalizedJob) -> dict[str, Any]:
         "strategic_career_value": {"weight": RATING_WEIGHTS["strategic_career_value"], "score": round(strategic_score, 1), "matches": matched_targets},
     }
     skill_fit_score = sum(categories[name]["score"] * weight for name, weight in RATING_WEIGHTS.items())
-    practical_penalty = 0.0
-    practical_terms = ["internship", "current enrollment", "currently enrolled", "uk work authorization", "japanese fluency", "japanese required"]
-    practical_notes = _matched_terms(practical_terms, text)
-    if practical_notes:
-        practical_penalty = min(3.0, 1.25 * len(practical_notes))
+    practical_penalty = 0.0 if not gaps else min(3.0, 0.75 * len(set(gaps)))
     overall_score = max(1.0, min(9.5, skill_fit_score - practical_penalty))
 
     return {
@@ -714,7 +892,7 @@ def rate_job_fit(profile: dict[str, Any], job: NormalizedJob) -> dict[str, Any]:
         "categories": categories,
         "evidence": evidence,
         "gaps": sorted(set(gaps)),
-        "practical_notes": practical_notes,
+        "practical_notes": sorted(set(gaps)),
         "score_scale": "0-10",
     }
 
@@ -852,6 +1030,23 @@ class Database:
                 created_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS job_fast_ratings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id INTEGER NOT NULL REFERENCES jobs(id),
+                profile_extraction_id INTEGER NOT NULL REFERENCES profile_extractions(id),
+                profile_hash TEXT NOT NULL,
+                job_content_hash TEXT NOT NULL,
+                rater_version TEXT NOT NULL,
+                model_name TEXT NOT NULL,
+                bucket TEXT NOT NULL,
+                confidence TEXT NOT NULL,
+                reason_codes_json TEXT NOT NULL,
+                short_reason TEXT NOT NULL,
+                rating_json TEXT NOT NULL,
+                is_current INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS job_ingestion_audits (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 job_id INTEGER NOT NULL REFERENCES jobs(id),
@@ -956,6 +1151,12 @@ class Database:
     def latest_job_rating(self, job_id: int) -> sqlite3.Row | None:
         return self.conn.execute(
             "SELECT * FROM job_ratings WHERE job_id=? AND is_current=1 ORDER BY created_at DESC, id DESC LIMIT 1",
+            (job_id,),
+        ).fetchone()
+
+    def latest_job_fast_rating(self, job_id: int) -> sqlite3.Row | None:
+        return self.conn.execute(
+            "SELECT * FROM job_fast_ratings WHERE job_id=? AND is_current=1 ORDER BY created_at DESC, id DESC LIMIT 1",
             (job_id,),
         ).fetchone()
 
@@ -1104,13 +1305,154 @@ RESUME TEXT:
             filter_reason=row["filter_reason"],
         )
 
+    def fast_rate_job_with_llm(
+        self,
+        job_id: int,
+        llm_client=call_openai_compatible_json,
+        model_name: str | None = None,
+        force: bool = False,
+        persist: bool = True,
+    ) -> sqlite3.Row | dict[str, Any]:
+        profile_row = self.latest_active_llm_profile()
+        if profile_row is None:
+            raise ValueError("Run LLM profile extraction before fast-rating jobs.")
+        job_row = self.conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+        if job_row is None:
+            raise ValueError("Job not found.")
+        model = model_name or configured_llm_model()
+        job_hash = content_hash(job_row["title"], job_row["location"], job_row["description_text"], job_row["job_url"])
+        if not force:
+            cached = self.conn.execute(
+                """
+                SELECT * FROM job_fast_ratings
+                WHERE job_id=? AND profile_extraction_id=? AND profile_hash=? AND job_content_hash=?
+                  AND rater_version=? AND model_name=? AND is_current=1
+                ORDER BY created_at DESC, id DESC LIMIT 1
+                """,
+                (job_id, profile_row["id"], profile_row["profile_hash"], job_hash, FAST_RATING_PROMPT_VERSION, model),
+            ).fetchone()
+            if cached:
+                return cached
+        profile = json.loads(profile_row["profile_json"])
+        job_payload = {
+            "title": job_row["title"],
+            "company": job_row["company_name"],
+            "location": job_row["location"],
+            "department": job_row["department"],
+            "description": job_row["description_text"],
+            "job_url": job_row["job_url"],
+        }
+        system_prompt = "Return only valid JSON. You are a fast, recall-heavy job-fit triage classifier."
+        user_prompt = f"""
+Decide whether this job is plausibly a 7/10 or better fit for the candidate. This is a recall-biased prefilter, not the final rating.
+
+Use the CANDIDATE PROFILE JSON extracted from the resume as the source of fit signals. Do not rely on hidden hardcoded keyword lists. Compare the job to the profile's target roles, skills, domains, proof points, seniority, strengths, gaps, and constraints.
+
+Prefer false positives over false negatives. If the role has plausible alignment and no clear blocker, choose gte_7 so it can receive deeper rating later. DeepSeek/cheap fast models can be over-strict, so use the safest recall-preserving bucket, not the neatest-looking rejection.
+
+Bucket policy:
+- choose gte_7 for plausible 7+ fits, direct matches to extracted target roles, adjacent roles that use extracted transferable skills/domains/proof points, or uncertain but promising jobs with transferable evidence from the current profile.
+- choose needs_manual_review when the evidence is ambiguous, mixed, or too thin to safely reject.
+- choose needs_manual_review, not lt_7, for stretch seniority, international/onsite locations, customer-facing variants, unfamiliar title wording, or adjacent data/platform/operations roles when the profile has any transferable bridge. For recall safety, even explicit practical concerns such as location, work authorization, clearance, language, seniority, or missing specialized subdomain experience should usually be needs_manual_review when there is a plausible bridge, because deep rating or the user can verify feasibility.
+- choose lt_7 only when the role is clearly irrelevant/wrong-function with no transferable bridge, or when a non-negotiable requirement explicitly conflicts with the extracted profile and there is no meaningful role/skill/domain/proof-point overlap to justify deeper review.
+
+Do not use lt_7 for merely imperfect matches, missing one preferred skill, partial domain mismatch, stretch seniority, unfamiliar title wording, international location, customer-facing framing, explicit-but-reviewable practical concerns, or roles that need tailoring but still use the candidate's extracted target roles, transferable skills, domains, proof points, or strengths. Those should be gte_7 when plausible, or needs_manual_review when genuinely uncertain.
+
+Profile-agnostic decision examples:
+- Job title/function matches an extracted target role, or the description uses multiple extracted skills/domains/proof points with no hard blocker => gte_7.
+- Job is adjacent to an extracted target role and uses at least one extracted transferable skill/domain/proof point, but seniority, location, customer-facing scope, authorization, clearance, language, or requirements are unclear or potentially difficult => needs_manual_review, not lt_7.
+- Job has no meaningful overlap with extracted target roles/skills/domains/proof points, or has an explicit non-negotiable conflict plus no transferable bridge in the profile => lt_7.
+
+Precision is secondary; the deep rater will verify. The fast rater's job is to avoid missing plausible >=7 roles.
+
+Return JSON with keys:
+- bucket: one of gte_7, lt_7, needs_manual_review
+- confidence: low, medium, or high
+- reason_codes: short machine-readable strings
+- short_reason: one concise sentence
+
+CANDIDATE PROFILE JSON:
+{json.dumps(profile, ensure_ascii=False)}
+
+JOB JSON:
+{json.dumps(job_payload, ensure_ascii=False)}
+""".strip()
+        rating = normalize_fast_rating(llm_client(system_prompt=system_prompt, user_prompt=user_prompt, model_name=model))
+        rating_json = json.dumps(rating, sort_keys=True, ensure_ascii=False)
+        ts = now_iso()
+        if not persist:
+            return {
+                "job_id": job_id,
+                "profile_extraction_id": profile_row["id"],
+                "profile_hash": profile_row["profile_hash"],
+                "job_content_hash": job_hash,
+                "rater_version": FAST_RATING_PROMPT_VERSION,
+                "model_name": model,
+                "bucket": rating["bucket"],
+                "confidence": rating["confidence"],
+                "reason_codes_json": json.dumps(rating["reason_codes"], ensure_ascii=False),
+                "short_reason": rating["short_reason"],
+                "rating_json": rating_json,
+                "is_current": 0,
+                "created_at": ts,
+            }
+        self.conn.execute("UPDATE job_fast_ratings SET is_current=0 WHERE job_id=?", (job_id,))
+        cur = self.conn.execute(
+            """
+            INSERT INTO job_fast_ratings(
+                job_id, profile_extraction_id, profile_hash, job_content_hash, rater_version,
+                model_name, bucket, confidence, reason_codes_json, short_reason, rating_json, is_current, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+            """,
+            (
+                job_id, profile_row["id"], profile_row["profile_hash"], job_hash, FAST_RATING_PROMPT_VERSION,
+                model, rating["bucket"], rating["confidence"], json.dumps(rating["reason_codes"], ensure_ascii=False),
+                rating["short_reason"], rating_json, ts,
+            ),
+        )
+        self.conn.commit()
+        row = self.conn.execute("SELECT * FROM job_fast_ratings WHERE id=?", (cur.lastrowid,)).fetchone()
+        assert row is not None
+        return row
+
+    def fast_rate_jobs_with_llm(
+        self,
+        job_ids: Iterable[int],
+        llm_client=call_openai_compatible_json,
+        model_name: str | None = None,
+        force: bool = False,
+        progress_callback=None,
+        persist: bool = True,
+    ) -> dict[str, Any]:
+        unique_job_ids = list(dict.fromkeys(int(job_id) for job_id in job_ids))
+        summary: dict[str, Any] = {"requested": len(unique_job_ids), "rated": 0, "failed": 0, "completed": 0, "errors": [], "last_job_id": None, "bucket_counts": {}}
+        for job_id in unique_job_ids:
+            try:
+                row = self.fast_rate_job_with_llm(job_id, llm_client=llm_client, model_name=model_name, force=force, persist=persist)
+                summary["rated"] += 1
+                bucket = str(row["bucket"])
+                summary["bucket_counts"][bucket] = summary["bucket_counts"].get(bucket, 0) + 1
+                status = "rated"
+                error = None
+            except Exception as exc:
+                summary["failed"] += 1
+                error = str(exc)
+                summary["errors"].append({"job_id": job_id, "error": error})
+                status = "failed"
+            summary["completed"] += 1
+            summary["last_job_id"] = job_id
+            if progress_callback:
+                progress_callback({**summary, "status": status, "job_id": job_id, "error": error})
+        return summary
+
     def rate_job_with_llm(
         self,
         job_id: int,
         llm_client=call_openai_compatible_json,
         model_name: str | None = None,
         force: bool = False,
-    ) -> sqlite3.Row:
+        persist: bool = True,
+    ) -> sqlite3.Row | dict[str, Any]:
         profile_row = self.latest_active_llm_profile()
         if profile_row is None:
             raise ValueError("Run LLM profile extraction before rating jobs.")
@@ -1143,6 +1485,7 @@ RESUME TEXT:
         system_prompt = "Return only valid JSON. You are a rigorous job-fit evaluator using the provided rubric."
         user_prompt = f"""
 Rate this job for the candidate using expected interview probability plus role fit, not title similarity.
+Use only the CANDIDATE PROFILE JSON below for candidate-specific roles, domains, skills, proof points, gaps, constraints, and evidence. Do not add hidden candidate assumptions, hardcoded examples, or external profile knowledge.
 
 REFERENCE 7-CATEGORY RUBRIC:
 {REFERENCE_RUBRIC}
@@ -1161,6 +1504,23 @@ JOB JSON:
         rating = normalize_llm_rating(llm_client(system_prompt=system_prompt, user_prompt=user_prompt, model_name=model))
         rating_json = json.dumps(rating, sort_keys=True, ensure_ascii=False)
         ts = now_iso()
+        if not persist:
+            return {
+                "job_id": job_id,
+                "profile_extraction_id": profile_row["id"],
+                "profile_hash": profile_row["profile_hash"],
+                "job_content_hash": job_hash,
+                "rubric_version": RATING_PROMPT_VERSION,
+                "rater_version": RATING_PROMPT_VERSION,
+                "model_name": model,
+                "overall_score": rating["overall_score"],
+                "skill_fit_score": rating["skill_fit_score"],
+                "practical_fit_score": rating["practical_fit_score"],
+                "recommendation": rating["recommendation"],
+                "rating_json": rating_json,
+                "is_current": 0,
+                "created_at": ts,
+            }
         self.conn.execute("UPDATE job_ratings SET is_current=0 WHERE job_id=?", (job_id,))
         cur = self.conn.execute(
             """
@@ -1308,6 +1668,9 @@ JOB JSON:
         self.conn.execute("UPDATE profile_extractions SET extraction_method='local' WHERE extraction_method IS NULL OR extraction_method='' ")
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_profile_extractions_method ON profile_extractions(extraction_method, is_active)")
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_job_ratings_current ON job_ratings(job_id, is_current)")
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_job_fast_ratings_current ON job_fast_ratings(job_id, is_current)")
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_job_ingestion_audits_job_id ON job_ingestion_audits(job_id, id)")
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_job_raw_snapshots_job_id ON job_raw_snapshots(job_id, id)")
         self.conn.commit()
 
     def backfill_missing_ingestion_audits(self) -> None:
@@ -1916,6 +2279,23 @@ def parse_refresh_form(params: dict[str, list[str]]) -> tuple[dict[str, Any], di
     return request, redirect_params
 
 
+def rating_status_condition(rating_status: str) -> str | None:
+    if rating_status == "unrated":
+        return "jr.id IS NULL AND jfr.id IS NULL"
+    if rating_status == "fast_rated":
+        return "jr.id IS NULL AND jfr.id IS NOT NULL AND jfr.bucket != 'needs_manual_review'"
+    if rating_status == "needs_manual_review":
+        return "jr.id IS NULL AND jfr.id IS NOT NULL AND jfr.bucket = 'needs_manual_review'"
+    if rating_status == "deep_rated":
+        return "jr.id IS NOT NULL"
+    return None
+
+
+def current_fast_rating_bucket(db: Database, job_id: int) -> str | None:
+    row = db.latest_job_fast_rating(job_id)
+    return str(row["bucket"]) if row else None
+
+
 def query_jobs_from_db(db: Database, params: dict[str, list[str]]) -> tuple[list[sqlite3.Row], int, int, int, int]:
     where = []
     values: list[Any] = []
@@ -1923,6 +2303,7 @@ def query_jobs_from_db(db: Database, params: dict[str, list[str]]) -> tuple[list
     status = params.get("status", [""])[0]
     source_status = params.get("source_status", [status])[0]
     review_status = params.get("review_status", [""])[0]
+    rating_status = params.get("rating_status", [""])[0]
     saved_mode = params.get("saved", [""])[0]
     hidden_mode = params.get("hidden", [""])[0] or "exclude"
     q = params.get("q", [""])[0].strip()
@@ -1941,6 +2322,9 @@ def query_jobs_from_db(db: Database, params: dict[str, list[str]]) -> tuple[list
     if review_status:
         where.append("j.review_status=?")
         values.append(review_status)
+    rating_condition = rating_status_condition(rating_status)
+    if rating_condition:
+        where.append(rating_condition)
     if saved_mode == "saved":
         where.append("j.is_saved=1")
     elif saved_mode == "unsaved":
@@ -1972,7 +2356,12 @@ def query_jobs_from_db(db: Database, params: dict[str, list[str]]) -> tuple[list
             SELECT MAX(jr2.id) FROM job_ratings jr2 WHERE jr2.job_id = j.id AND jr2.is_current=1
         )
     """
-    base_from = f"FROM jobs j JOIN companies c ON c.id=j.company_id {audit_join} {rating_join}"
+    fast_rating_join = """
+        LEFT JOIN job_fast_ratings jfr ON jfr.id = (
+            SELECT MAX(jfr2.id) FROM job_fast_ratings jfr2 WHERE jfr2.job_id = j.id AND jfr2.is_current=1
+        )
+    """
+    base_from = f"FROM jobs j JOIN companies c ON c.id=j.company_id {audit_join} {rating_join} {fast_rating_join}"
     where_sql = " WHERE " + " AND ".join(where) if where else ""
     order_sql = order_by_sql(sort_key)
     total = int(db.conn.execute(f"SELECT COUNT(*) {base_from}{where_sql}", values).fetchone()[0])
@@ -1988,7 +2377,12 @@ def query_jobs_from_db(db: Database, params: dict[str, list[str]]) -> tuple[list
                COALESCE(a.extra_keys_json, '[]') AS audit_extra_keys_json,
                COALESCE(a.description_length, LENGTH(COALESCE(j.description_text, ''))) AS audit_description_length,
                COALESCE(a.location_status, 'unknown') AS audit_location_status,
-               COALESCE(a.detail_fetch_status, 'unknown') AS audit_detail_fetch_status
+               COALESCE(a.detail_fetch_status, 'unknown') AS audit_detail_fetch_status,
+               jr.overall_score AS deep_overall_score,
+               jr.recommendation AS deep_recommendation,
+               jfr.bucket AS fast_rating_bucket,
+               jfr.confidence AS fast_rating_confidence,
+               jfr.short_reason AS fast_rating_reason
         {base_from}
         {where_sql}
         ORDER BY {order_sql}
@@ -2015,6 +2409,7 @@ def query_job_ids_from_db(db: Database, params: dict[str, list[str]], scope: str
     status = params.get("status", [""])[0]
     source_status = params.get("source_status", [status])[0]
     review_status = params.get("review_status", [""])[0]
+    rating_status = params.get("rating_status", [""])[0]
     saved_mode = params.get("saved", [""])[0]
     hidden_mode = params.get("hidden", [""])[0] or "exclude"
     q = params.get("q", [""])[0].strip()
@@ -2031,6 +2426,9 @@ def query_job_ids_from_db(db: Database, params: dict[str, list[str]], scope: str
     if review_status:
         where.append("j.review_status=?")
         values.append(review_status)
+    rating_condition = rating_status_condition(rating_status)
+    if rating_condition:
+        where.append(rating_condition)
     if saved_mode == "saved":
         where.append("j.is_saved=1")
     elif saved_mode == "unsaved":
@@ -2058,11 +2456,16 @@ def query_job_ids_from_db(db: Database, params: dict[str, list[str]], scope: str
             SELECT MAX(jr2.id) FROM job_ratings jr2 WHERE jr2.job_id = j.id AND jr2.is_current=1
         )
     """
+    fast_rating_join = """
+        LEFT JOIN job_fast_ratings jfr ON jfr.id = (
+            SELECT MAX(jfr2.id) FROM job_fast_ratings jfr2 WHERE jfr2.job_id = j.id AND jfr2.is_current=1
+        )
+    """
     order_sql = order_by_sql(sort_key)
     rows = db.conn.execute(
         f"""
         SELECT j.id
-        FROM jobs j JOIN companies c ON c.id=j.company_id {rating_join}
+        FROM jobs j JOIN companies c ON c.id=j.company_id {rating_join} {fast_rating_join}
         {where_sql}
         ORDER BY {order_sql}
         """,
@@ -2235,9 +2638,12 @@ def render_profile_section(db: Database | None = None) -> str:
 
 def render_rating_badge_for_job(db: Database, job_id: int) -> str:
     rating = db.latest_job_rating(job_id)
-    if not rating:
-        return ""
-    return f'<p class="rating-badge">Fit score: {esc(rating["overall_score"])} · {esc(rating["recommendation"])}</p>'
+    if rating:
+        return f'<p class="rating-badge">Deep fit score: {esc(rating["overall_score"])} · {esc(rating["recommendation"])}</p>'
+    fast_rating = db.latest_job_fast_rating(job_id)
+    if fast_rating:
+        return f'<p class="rating-badge">Fast rating: {esc(fast_rating_bucket_label(fast_rating["bucket"]))} · {esc(fast_rating["confidence"])} confidence</p>'
+    return ""
 
 
 def render_rating_section(db: Database, job_id: int) -> str:
@@ -2282,19 +2688,43 @@ def render_bulk_rating_controls(params: dict[str, list[str]], page_job_ids: list
     common_return = f'<input type="hidden" name="return_to" value="{esc(return_to)}" />'
     return f"""
         <section class="top-action" aria-label="Bulk LLM rating controls">
+          <form method="post" action="/jobs/rate-fast-bulk">
+            <input type="hidden" name="scope" value="all" />
+            {common_return}
+            {''.join(query_inputs)}
+            <button type="submit">Fast rate unrated matching jobs</button>
+          </form>
+          <form method="post" action="/jobs/rate-fast-bulk">
+            <input type="hidden" name="scope" value="page" />
+            {common_return}
+            {page_inputs}
+            <button type="submit">Fast rate unrated jobs on this page</button>
+          </form>
+          <form method="post" action="/jobs/rate-bulk">
+            <input type="hidden" name="scope" value="fast_gte_7" />
+            {common_return}
+            {''.join(query_inputs)}
+            <button type="submit">Deep rate fast-rated &gt;=7 matching jobs</button>
+          </form>
+          <form method="post" action="/jobs/rate-bulk">
+            <input type="hidden" name="scope" value="fast_gte_7_page" />
+            {common_return}
+            {page_inputs}
+            <button type="submit">Deep rate fast-rated &gt;=7 jobs on this page</button>
+          </form>
           <form method="post" action="/jobs/rate-bulk">
             <input type="hidden" name="scope" value="all" />
             {common_return}
             {''.join(query_inputs)}
-            <button type="submit">Rate all matching jobs with LLM</button>
+            <button type="submit">Deep rate all matching jobs with LLM</button>
           </form>
           <form method="post" action="/jobs/rate-bulk">
             <input type="hidden" name="scope" value="page" />
             {common_return}
             {page_inputs}
-            <button type="submit">Rate jobs on this page with LLM</button>
+            <button type="submit">Deep rate jobs on this page with LLM</button>
           </form>
-          <small class="hint wide">Bulk rating runs in the background, reuses current cached ratings, and may require refreshing this page to see completion status.</small>
+          <small class="hint wide">Fast rating is the cheap recall-heavy gate. Deep rating is the current full LLM v2 rating and runs in the background.</small>
         </section>
     """
 
@@ -2332,6 +2762,7 @@ def render_index(params: dict[str, list[str]]) -> str:
     status = params.get("status", [""])[0]
     source_status = params.get("source_status", [status])[0]
     review_status = params.get("review_status", [""])[0]
+    rating_status = params.get("rating_status", [""])[0]
     saved_mode = params.get("saved", [""])[0]
     hidden_mode = params.get("hidden", [""])[0] or "exclude"
     sort_key = params.get("sort", ["default"])[0] or "default"
@@ -2339,7 +2770,9 @@ def render_index(params: dict[str, list[str]]) -> str:
     flash = params.get("flash", [""])[0]
     flash_html = f'<p class="flash">{esc(flash)}</p>' if flash else ""
     bulk_job = background_job_snapshot("llm_bulk_rating")
+    fast_job = background_job_snapshot("llm_fast_rating")
     bulk_status_html = f'<p class="flash">{esc(bulk_job["message"])}</p>' if bulk_job else ""
+    fast_status_html = f'<p class="flash">{esc(fast_job["message"])}</p>' if fast_job else ""
     start_num = ((page - 1) * per_page + 1) if total else 0
     end_num = min(page * per_page, total)
     prev_link = f"/?{query_string(params, page=page - 1)}" if page > 1 else ""
@@ -2392,6 +2825,7 @@ def render_index(params: dict[str, list[str]]) -> str:
           <p>Databricks + NVIDIA jobs from official career APIs. Showing {start_num}-{end_num} of {total} matching jobs.</p>
         </header>
         {flash_html}
+        {fast_status_html}
         {bulk_status_html}
         <details class="dashboard-panel refresh-panel" data-panel-key="refresh" open>
           <summary>Refresh jobs</summary>
@@ -2462,6 +2896,10 @@ def render_index(params: dict[str, list[str]]) -> str:
           <select name="review_status">
             <option value="">All review statuses</option>
             {''.join(f'<option value="{s}" {"selected" if review_status == s else ""}>{s}</option>' for s in ['unreviewed','reviewed','applied'])}
+          </select>
+          <select name="rating_status">
+            <option value="">All rating states</option>
+            {''.join(f'<option value="{s}" {"selected" if rating_status == s else ""}>{s}</option>' for s in ['unrated','fast_rated','needs_manual_review','deep_rated'])}
           </select>
           <select name="saved">
             <option value="" {'selected' if saved_mode == '' else ''}>All saved states</option>
@@ -2640,20 +3078,13 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         if parsed.path == "/resumes/upload":
             try:
-                form = cgi.FieldStorage(
-                    fp=self.rfile,
-                    headers=self.headers,
-                    environ={
-                        "REQUEST_METHOD": "POST",
-                        "CONTENT_TYPE": self.headers.get("Content-Type", ""),
-                    },
-                )
-                field = form["resume"] if "resume" in form else None
-                if field is None or not getattr(field, "filename", None):
+                length = int(self.headers.get("Content-Length", "0") or 0)
+                body = self.rfile.read(length)
+                field = parse_multipart_file_field(self.headers.get("Content-Type", ""), body, "resume")
+                if field is None:
                     raise ValueError("Choose a resume file to upload.")
-                content = field.file.read()
                 db = Database(); db.init()
-                db.upload_resume_file(field.filename, content, getattr(field, "type", None))
+                db.upload_resume_file(field["filename"], field["content"], field["content_type"])
                 self.send_redirect("/?flash=" + urllib.parse.quote("Resume uploaded. Profile extraction was not run automatically."))
             except Exception as exc:
                 self.send_redirect("/?flash=" + urllib.parse.quote(f"Resume upload failed: {exc}"))
@@ -2715,12 +3146,49 @@ class Handler(BaseHTTPRequestHandler):
             separator = "&" if "?" in return_to else "?"
             self.send_redirect(f"{return_to}{separator}flash=" + urllib.parse.quote(f"Unhid {count} jobs."))
             return
+        if parsed.path == "/jobs/rate-fast-bulk":
+            try:
+                scope = params.get("scope", ["all"])[0] or "all"
+                return_to = params.get("return_to", ["/"])[0] or "/"
+                db = Database(); db.init()
+                try:
+                    if scope == "page":
+                        candidate_ids = [int(value) for value in params.get("job_id", [])]
+                        job_ids = [job_id for job_id in candidate_ids if db.latest_job_rating(job_id) is None and db.latest_job_fast_rating(job_id) is None]
+                    else:
+                        scoped_params = dict(params)
+                        scoped_params["rating_status"] = ["unrated"]
+                        job_ids = query_job_ids_from_db(db, scoped_params, scope="all")
+                finally:
+                    db.conn.close()
+                job = start_llm_fast_rating_background(DB_PATH, job_ids, force=True)
+                separator = "&" if "?" in return_to else "?"
+                self.send_redirect(f"{return_to}{separator}flash=" + urllib.parse.quote(job["message"]))
+            except Exception as exc:
+                return_to = params.get("return_to", ["/"])[0] or "/"
+                separator = "&" if "?" in return_to else "?"
+                self.send_redirect(f"{return_to}{separator}flash=" + urllib.parse.quote(f"Could not start fast LLM rating: {exc}"))
+            return
         if parsed.path == "/jobs/rate-bulk":
             try:
                 scope = params.get("scope", ["all"])[0] or "all"
                 return_to = params.get("return_to", ["/"])[0] or "/"
                 if scope == "page":
                     job_ids = [int(value) for value in params.get("job_id", [])]
+                elif scope == "fast_gte_7_page":
+                    candidate_ids = [int(value) for value in params.get("job_id", [])]
+                    db = Database(); db.init()
+                    try:
+                        job_ids = [job_id for job_id in candidate_ids if current_fast_rating_bucket(db, job_id) == "gte_7"]
+                    finally:
+                        db.conn.close()
+                elif scope == "fast_gte_7":
+                    db = Database(); db.init()
+                    try:
+                        candidate_ids = query_job_ids_from_db(db, params, scope="all")
+                        job_ids = [job_id for job_id in candidate_ids if current_fast_rating_bucket(db, job_id) == "gte_7"]
+                    finally:
+                        db.conn.close()
                 else:
                     db = Database(); db.init()
                     try:
@@ -2767,6 +3235,289 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
 
+def benchmark_fast_rating(
+    sample_size: int = 100,
+    db_path: Path = DB_PATH,
+    llm_client=call_openai_compatible_json,
+    model_name: str | None = None,
+    fast_mode: str = "default",
+    save: bool = False,
+) -> dict[str, Any]:
+    """Run a fast-rating benchmark on a random unrated sample; dry-run/no-write by default."""
+    db = Database(db_path)
+    db.init()
+    rows = db.conn.execute(
+        """
+        SELECT j.id FROM jobs j
+        WHERE j.is_hidden=0
+          AND NOT EXISTS (SELECT 1 FROM job_ratings jr WHERE jr.job_id=j.id AND jr.is_current=1)
+          AND NOT EXISTS (SELECT 1 FROM job_fast_ratings jfr WHERE jfr.job_id=j.id AND jfr.is_current=1)
+        ORDER BY RANDOM()
+        LIMIT ?
+        """,
+        (sample_size,),
+    ).fetchall()
+    job_ids = [int(row["id"]) for row in rows]
+    start = time.monotonic()
+    resolved_model_name = fast_model_name_for_mode(fast_mode, model_name)
+    result = db.fast_rate_jobs_with_llm(job_ids, llm_client=llm_client, model_name=resolved_model_name, force=True, persist=save)
+    elapsed = time.monotonic() - start
+    db.conn.close()
+    return {
+        **result,
+        "dry_run": not save,
+        "saved": save,
+        "fast_mode": fast_mode,
+        "fast_model_name": resolved_model_name or configured_llm_model(),
+        "elapsed_seconds": round(elapsed, 2),
+        "jobs_per_minute": round((len(job_ids) / elapsed) * 60, 2) if elapsed else None,
+        "note": (
+            "Dry run: called the LLM but did not write fast ratings. Re-run with --save to persist results. "
+            "Token/cost usage depends on provider accounting; check your provider dashboard for exact billed tokens."
+            if not save else
+            "Saved fast ratings to job_fast_ratings. Token/cost usage depends on provider accounting; check your provider dashboard for exact billed tokens."
+        ),
+    }
+
+
+def compare_fast_vs_deep_rating(
+    sample_size: int = 100,
+    db_path: Path = DB_PATH,
+    fast_llm_client=call_openai_compatible_json,
+    deep_llm_client=call_openai_compatible_json,
+    model_name: str | None = None,
+    fast_model_name: str | None = None,
+    deep_model_name: str | None = None,
+    fast_mode: str = "default",
+    threshold: float = 7.0,
+    save: bool = False,
+) -> dict[str, Any]:
+    """Run fast and deep LLM ratings on the same sample and compare fast buckets against deep score bands."""
+    db = Database(db_path)
+    db.init()
+    rows = db.conn.execute(
+        """
+        SELECT j.id, j.title, j.company_name FROM jobs j
+        WHERE j.is_hidden=0
+          AND NOT EXISTS (SELECT 1 FROM job_ratings jr WHERE jr.job_id=j.id AND jr.is_current=1)
+          AND NOT EXISTS (SELECT 1 FROM job_fast_ratings jfr WHERE jfr.job_id=j.id AND jfr.is_current=1)
+        ORDER BY RANDOM()
+        LIMIT ?
+        """,
+        (sample_size,),
+    ).fetchall()
+    start = time.monotonic()
+    resolved_fast_model_name = fast_model_name_for_mode(fast_mode, fast_model_name or model_name)
+    resolved_deep_model_name = deep_model_name or model_name
+    confusion = {"true_positive": 0, "false_positive": 0, "true_negative": 0, "false_negative": 0, "manual_review": 0}
+    bucket_counts: dict[str, int] = {}
+    examples: list[dict[str, Any]] = []
+    false_negatives: list[dict[str, Any]] = []
+    manual_reviews: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+    compared = 0
+    for row in rows:
+        job_id = int(row["id"])
+        try:
+            fast_row = db.fast_rate_job_with_llm(job_id, llm_client=fast_llm_client, model_name=resolved_fast_model_name, force=True, persist=save)
+            deep_row = db.rate_job_with_llm(job_id, llm_client=deep_llm_client, model_name=resolved_deep_model_name, force=True, persist=save)
+            bucket = str(fast_row["bucket"])
+            score = float(deep_row["overall_score"])
+            deep_positive = score >= threshold
+            bucket_counts[bucket] = bucket_counts.get(bucket, 0) + 1
+            compared += 1
+            if bucket == "needs_manual_review":
+                confusion["manual_review"] += 1
+                outcome = "manual_review"
+            elif bucket == "gte_7" and deep_positive:
+                confusion["true_positive"] += 1
+                outcome = "true_positive"
+            elif bucket == "gte_7" and not deep_positive:
+                confusion["false_positive"] += 1
+                outcome = "false_positive"
+            elif bucket == "lt_7" and deep_positive:
+                confusion["false_negative"] += 1
+                outcome = "false_negative"
+            else:
+                confusion["true_negative"] += 1
+                outcome = "true_negative"
+            example = {
+                "job_id": job_id,
+                "title": row["title"],
+                "company": row["company_name"],
+                "fast_bucket": bucket,
+                "deep_score": score,
+                "outcome": outcome,
+            }
+            examples.append(example)
+            if outcome == "false_negative":
+                false_negatives.append(example)
+            if outcome == "manual_review":
+                manual_reviews.append(example)
+        except Exception as exc:
+            errors.append({"job_id": job_id, "error": str(exc)})
+    elapsed = time.monotonic() - start
+    db.conn.close()
+    tp = confusion["true_positive"]
+    fp = confusion["false_positive"]
+    tn = confusion["true_negative"]
+    fn = confusion["false_negative"]
+    precision = round(tp / (tp + fp), 4) if (tp + fp) else None
+    recall = round(tp / (tp + fn), 4) if (tp + fn) else None
+    accuracy = round((tp + tn) / (tp + fp + tn + fn), 4) if (tp + fp + tn + fn) else None
+    return {
+        "requested": len(rows),
+        "compared": compared,
+        "failed": len(errors),
+        "errors": errors,
+        "dry_run": not save,
+        "saved": save,
+        "fast_mode": fast_mode,
+        "fast_model_name": resolved_fast_model_name or configured_llm_model(),
+        "deep_model_name": resolved_deep_model_name or configured_llm_model(),
+        "threshold": threshold,
+        "confusion_matrix": confusion,
+        "precision": precision,
+        "recall": recall,
+        "accuracy_excluding_manual_review": accuracy,
+        "bucket_counts": bucket_counts,
+        "elapsed_seconds": round(elapsed, 2),
+        "jobs_per_minute": round((compared / elapsed) * 60, 2) if elapsed else None,
+        "false_negatives": false_negatives,
+        "manual_reviews": manual_reviews,
+        "examples": examples[:25],
+        "note": (
+            "Dry run: called both fast and deep LLM raters but did not write ratings. "
+            "needs_manual_review is counted separately, not as pass/fail. Use provider dashboard for exact tokens/cost."
+            if not save else
+            "Saved both fast and deep ratings. needs_manual_review is counted separately. Use provider dashboard for exact tokens/cost."
+        ),
+    }
+
+
+def _empty_comparison_summary(model_name: str | None) -> dict[str, Any]:
+    return {
+        "model_name": model_name,
+        "confusion_matrix": {"true_positive": 0, "false_positive": 0, "true_negative": 0, "false_negative": 0, "manual_review": 0},
+        "bucket_counts": {},
+        "precision": None,
+        "recall": None,
+        "accuracy_excluding_manual_review": None,
+        "false_negatives": [],
+        "manual_reviews": [],
+        "examples": [],
+    }
+
+
+def _add_fast_deep_comparison(summary: dict[str, Any], example: dict[str, Any], threshold: float) -> None:
+    bucket = str(example["fast_bucket"])
+    score = float(example["deep_score"])
+    deep_positive = score >= threshold
+    summary["bucket_counts"][bucket] = summary["bucket_counts"].get(bucket, 0) + 1
+    if bucket == "needs_manual_review":
+        outcome = "manual_review"
+    elif bucket == "gte_7" and deep_positive:
+        outcome = "true_positive"
+    elif bucket == "gte_7" and not deep_positive:
+        outcome = "false_positive"
+    elif bucket == "lt_7" and deep_positive:
+        outcome = "false_negative"
+    else:
+        outcome = "true_negative"
+    example["outcome"] = outcome
+    summary["confusion_matrix"][outcome] += 1
+    summary["examples"].append(example)
+    if outcome == "false_negative":
+        summary["false_negatives"].append(example)
+    if outcome == "manual_review":
+        summary["manual_reviews"].append(example)
+
+
+def _finalize_comparison_summary(summary: dict[str, Any]) -> None:
+    matrix = summary["confusion_matrix"]
+    tp = matrix["true_positive"]
+    fp = matrix["false_positive"]
+    tn = matrix["true_negative"]
+    fn = matrix["false_negative"]
+    summary["precision"] = round(tp / (tp + fp), 4) if (tp + fp) else None
+    summary["recall"] = round(tp / (tp + fn), 4) if (tp + fn) else None
+    summary["accuracy_excluding_manual_review"] = round((tp + tn) / (tp + fp + tn + fn), 4) if (tp + fp + tn + fn) else None
+    summary["examples"] = summary["examples"][:25]
+
+
+def compare_rating_models(
+    sample_size: int = 100,
+    db_path: Path = DB_PATH,
+    deep_llm_client=call_openai_compatible_json,
+    default_fast_llm_client=call_openai_compatible_json,
+    openrouter_fast_llm_client=deepseek_v4_flash_openrouter_client,
+    deep_model_name: str | None = None,
+    default_fast_model_name: str | None = None,
+    openrouter_fast_model_name: str | None = None,
+    threshold: float = 7.0,
+    save: bool = False,
+) -> dict[str, Any]:
+    """Compare deep rating, previous/default fast rating, and DeepSeek v4 Flash fast rating on one sample."""
+    db = Database(db_path)
+    db.init()
+    rows = db.conn.execute(
+        """
+        SELECT j.id, j.title, j.company_name FROM jobs j
+        WHERE j.is_hidden=0
+          AND NOT EXISTS (SELECT 1 FROM job_ratings jr WHERE jr.job_id=j.id AND jr.is_current=1)
+          AND NOT EXISTS (SELECT 1 FROM job_fast_ratings jfr WHERE jfr.job_id=j.id AND jfr.is_current=1)
+        ORDER BY RANDOM()
+        LIMIT ?
+        """,
+        (sample_size,),
+    ).fetchall()
+    resolved_deep_model_name = deep_model_name or configured_llm_model()
+    resolved_default_fast_model_name = default_fast_model_name or resolved_deep_model_name
+    resolved_openrouter_fast_model_name = openrouter_fast_model_name or DEEPSEEK_V4_FLASH_OPENROUTER_MODEL
+    summaries = {
+        "previous_fast": _empty_comparison_summary(resolved_default_fast_model_name),
+        "openrouter_v4_flash": _empty_comparison_summary(resolved_openrouter_fast_model_name),
+    }
+    errors: list[dict[str, Any]] = []
+    compared = 0
+    start = time.monotonic()
+    for row in rows:
+        job_id = int(row["id"])
+        try:
+            deep_row = db.rate_job_with_llm(job_id, llm_client=deep_llm_client, model_name=resolved_deep_model_name, force=True, persist=save)
+            previous_fast_row = db.fast_rate_job_with_llm(job_id, llm_client=default_fast_llm_client, model_name=resolved_default_fast_model_name, force=True, persist=save)
+            openrouter_fast_row = db.fast_rate_job_with_llm(job_id, llm_client=openrouter_fast_llm_client, model_name=resolved_openrouter_fast_model_name, force=True, persist=save)
+            deep_score = float(deep_row["overall_score"])
+            base = {"job_id": job_id, "title": row["title"], "company": row["company_name"], "deep_score": deep_score}
+            _add_fast_deep_comparison(summaries["previous_fast"], {**base, "fast_bucket": str(previous_fast_row["bucket"])}, threshold)
+            _add_fast_deep_comparison(summaries["openrouter_v4_flash"], {**base, "fast_bucket": str(openrouter_fast_row["bucket"])}, threshold)
+            compared += 1
+        except Exception as exc:
+            errors.append({"job_id": job_id, "error": str(exc)})
+    elapsed = time.monotonic() - start
+    db.conn.close()
+    for summary in summaries.values():
+        _finalize_comparison_summary(summary)
+    return {
+        "requested": len(rows),
+        "compared": compared,
+        "failed": len(errors),
+        "errors": errors,
+        "dry_run": not save,
+        "saved": save,
+        "threshold": threshold,
+        "deep_model_name": resolved_deep_model_name,
+        "fast_models": summaries,
+        "elapsed_seconds": round(elapsed, 2),
+        "jobs_per_minute": round((compared / elapsed) * 60, 2) if elapsed else None,
+        "note": (
+            "Dry run: called deep rating, previous/default fast rating, and OpenRouter DeepSeek v4 Flash fast rating on the same jobs without writing ratings."
+            if not save else
+            "Saved deep rating plus both fast-rating model results. Use provider dashboards for exact tokens/cost."
+        ),
+    }
+
+
 def serve(host: str, port: int) -> None:
     Database().init()
     server = ThreadingHTTPServer((host, port), Handler)
@@ -2790,6 +3541,22 @@ def main(argv: list[str] | None = None) -> int:
     serve_p.add_argument("--host", default="127.0.0.1")
     serve_p.add_argument("--port", default=8787, type=int)
 
+    bench_p = sub.add_parser("benchmark-fast-rating", help="Benchmark fast LLM pre-rating on a random unrated sample; dry-run/no-write by default")
+    bench_p.add_argument("--sample-size", type=int, default=100)
+    bench_p.add_argument("--fast-mode", choices=["default", "openrouter-v4-flash"], default="default", help="Fast rater provider/model mode; openrouter-v4-flash uses DeepSeek v4 Flash via OPENROUTER_API_KEY")
+    bench_p.add_argument("--save", action="store_true", help="Persist benchmark fast-rating results to job_fast_ratings")
+
+    compare_p = sub.add_parser("compare-fast-deep-rating", help="Run fast and deep LLM raters side by side on a sample; dry-run/no-write by default")
+    compare_p.add_argument("--sample-size", type=int, default=100)
+    compare_p.add_argument("--threshold", type=float, default=7.0, help="Deep-rating score threshold for treating a job as >=7")
+    compare_p.add_argument("--fast-mode", choices=["default", "openrouter-v4-flash"], default="default", help="Fast rater provider/model mode; openrouter-v4-flash uses DeepSeek v4 Flash via OPENROUTER_API_KEY while deep rating keeps the normal configured model")
+    compare_p.add_argument("--save", action="store_true", help="Persist both fast and deep rating results")
+
+    model_compare_p = sub.add_parser("compare-rating-models", help="Compare deep rating, previous/default fast rating, and DeepSeek v4 Flash fast rating on the same sample; dry-run/no-write by default")
+    model_compare_p.add_argument("--sample-size", type=int, default=100)
+    model_compare_p.add_argument("--threshold", type=float, default=7.0, help="Deep-rating score threshold for treating a job as >=7")
+    model_compare_p.add_argument("--save", action="store_true", help="Persist deep rating plus both fast-rating results")
+
     args = parser.parse_args(argv)
     if args.cmd == "init-db":
         Database().init()
@@ -2801,6 +3568,15 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.cmd == "serve":
         serve(args.host, args.port)
+        return 0
+    if args.cmd == "benchmark-fast-rating":
+        print(json.dumps(benchmark_fast_rating(sample_size=args.sample_size, llm_client=fast_llm_client_for_mode(args.fast_mode), fast_mode=args.fast_mode, save=args.save), indent=2))
+        return 0
+    if args.cmd == "compare-fast-deep-rating":
+        print(json.dumps(compare_fast_vs_deep_rating(sample_size=args.sample_size, fast_llm_client=fast_llm_client_for_mode(args.fast_mode), fast_mode=args.fast_mode, threshold=args.threshold, save=args.save), indent=2))
+        return 0
+    if args.cmd == "compare-rating-models":
+        print(json.dumps(compare_rating_models(sample_size=args.sample_size, threshold=args.threshold, save=args.save), indent=2))
         return 0
     return 1
 

@@ -9,16 +9,24 @@ from unittest.mock import MagicMock, patch
 
 from jobsearch.app import (
     Database,
+    FAST_RATING_PROMPT_VERSION,
     GreenhouseConnector,
     NormalizedJob,
     NvidiaWorkdayConnector,
     audit_badges,
+    background_job_snapshot,
     build_ingestion_audit,
     build_profile_from_texts,
     call_openai_compatible_json,
     filter_job,
+    load_environment_files,
     load_local_env,
     rate_job_fit,
+    benchmark_fast_rating,
+    compare_fast_vs_deep_rating,
+    compare_rating_models,
+    deepseek_v4_flash_openrouter_client,
+    fast_rating_bucket_label,
     get_job_from_db,
     parse_refresh_form,
     query_jobs_from_db,
@@ -33,6 +41,7 @@ from jobsearch.app import (
     reset_background_jobs_for_tests,
     display_local_time,
     start_llm_bulk_rating_background,
+    start_llm_fast_rating_background,
     should_expire_missing_after_refresh,
     start_llm_profile_extraction_background,
     strip_html,
@@ -40,6 +49,11 @@ from jobsearch.app import (
 
 
 class Phase0Tests(unittest.TestCase):
+    def test_app_module_does_not_depend_on_removed_cgi_module_at_import_time(self):
+        source = (Path(__file__).resolve().parents[1] / "jobsearch" / "app.py").read_text()
+        self.assertNotIn("import cgi", source)
+        self.assertNotIn("cgi.FieldStorage", source)
+
     def test_strip_html(self):
         self.assertEqual(strip_html("<p>Hello<br>World</p>"), "Hello\nWorld")
 
@@ -167,43 +181,43 @@ class Phase0Tests(unittest.TestCase):
             self.assertEqual(stale["is_active"], 0)
             self.assertFalse(db.latest_profile_is_current())
 
-    def test_profile_extractor_preserves_reference_rating_evidence(self):
+    def test_profile_extractor_uses_only_resume_derived_terms_without_profile_constants(self):
         profile = build_profile_from_texts([
             """
-            Google Control Tower supported 200+ users across 10+ contract manufacturing sites,
-            tracking capacity, lead time, yield, OEE, WIP, and production risk with dashboards and KPI governance.
-            Tesla warehouse optimization modeled 1,400 parts and 13,000 historical picks with mixed-integer optimization,
-            reducing travel and pick time by 42%. MS Data Science and Industrial Engineering background with SQL, Python, GCP,
-            machine learning, forecasting, BI tools, WMS/OMS, supply chain analytics, logistics, PCBA, and manufacturing.
-            Malema internship used Lean Six Sigma, 5S, workspace improvement, and Python calibration automation.
+            Custom orbital bakery program managed sourdough telemetry, yeast robotics,
+            vacuum oven optimization, and lunar logistics dashboards for 4+ years.
             """
         ])
 
-        self.assertIn("google_control_tower", profile["proof_points"])
-        self.assertIn("tesla_warehouse_optimization", profile["proof_points"])
-        self.assertIn("ms_data_science", profile["proof_points"])
-        self.assertIn("malema_internship", profile["proof_points"])
-        self.assertIn("supply chain", profile["domains"])
-        self.assertIn("warehouse optimization", profile["domains"])
-        self.assertIn("forecasting", profile["skills"])
-        self.assertIn("tech supply chain", profile["target_directions"])
-        self.assertGreaterEqual(profile["baseline_years_experience"], 3)
+        joined_skills = " ".join(profile["skills"])
+        self.assertIn("sourdough", joined_skills)
+        self.assertIn("telemetry", joined_skills)
+        self.assertEqual(profile["domains"], [])
+        self.assertEqual(profile["proof_points"], [])
+        self.assertEqual(profile["target_directions"], [])
+        self.assertGreaterEqual(profile["baseline_years_experience"], 4)
 
-    def test_rate_job_fit_scores_supply_chain_analytics_high_with_resume_evidence(self):
-        profile = build_profile_from_texts([
-            "Google Control Tower capacity, lead time, yield, OEE, WIP, production risk dashboards for 200+ users and 10+ contract manufacturing sites. "
-            "Tesla warehouse optimization with mixed-integer optimization for 1,400 parts and 13,000 picks. "
-            "MS Data Science, Industrial Engineering, SQL, Python, GCP, machine learning, forecasting, BI tools, WMS/OMS, supply chain analytics."
-        ])
+    def test_rate_job_fit_uses_only_terms_from_extracted_profile_json(self):
+        profile = {
+            "target_roles": ["Orbital Bakery Operations Analyst"],
+            "target_industries": ["space food logistics"],
+            "seniority": {"years_experience": 4},
+            "core_strengths": ["sourdough telemetry", "vacuum oven optimization"],
+            "technical_skills": ["yeast robotics", "lunar dashboards"],
+            "domain_skills": ["orbital bakery", "lunar logistics"],
+            "proof_points": [{"name": "Bakery Mission Control", "supports": ["vacuum oven optimization", "lunar logistics dashboards"]}],
+            "weaknesses_or_gaps": ["marine diesel repair"],
+            "practical_constraints": {"location": "remote preferred"},
+        }
         job = NormalizedJob(
-            company_name="TikTok",
+            company_name="Example",
             source="manual",
-            source_job_id="tt-1",
+            source_job_id="orbital-1",
             requisition_id=None,
-            title="Data Analyst, Supply Chain & Network Optimization",
-            location="San Jose, California",
+            title="Orbital Bakery Operations Analyst",
+            location="Remote",
             remote_type=None,
-            department="Supply Chain",
+            department="Space Food Logistics",
             employment_type=None,
             salary_min=None,
             salary_max=None,
@@ -211,31 +225,34 @@ class Phase0Tests(unittest.TestCase):
             job_url="https://example.com/job",
             apply_url="https://example.com/apply",
             description_raw_html="",
-            description_text="Capacity planning, SKU allocation, network optimization, SQL, Python, supply chain analytics, warehouse operations, forecasting dashboards.",
+            description_text="Lead sourdough telemetry, yeast robotics, vacuum oven optimization, and lunar logistics dashboards.",
             posted_at=None,
         )
 
         rating = rate_job_fit(profile, job)
 
-        self.assertGreaterEqual(rating["overall_score"], 9.0)
-        self.assertEqual(rating["recommendation"], "Apply ASAP")
-        self.assertGreaterEqual(rating["categories"]["core_job_function_match"]["score"], 9.0)
-        self.assertIn("google_control_tower", rating["evidence"])
-        self.assertIn("tesla_warehouse_optimization", rating["evidence"])
+        self.assertGreaterEqual(rating["overall_score"], 8.0)
+        self.assertIn("Orbital Bakery Operations Analyst", rating["categories"]["core_job_function_match"]["matches"])
+        self.assertIn("yeast robotics", rating["categories"]["technical_tool_match"]["matches"])
+        self.assertIn("lunar logistics", rating["categories"]["domain_match"]["matches"])
+        self.assertFalse(rating["gaps"])
 
-    def test_rate_job_fit_penalizes_wrong_function_and_hard_blockers(self):
-        profile = build_profile_from_texts([
-            "MS Data Science, Industrial Engineering, SQL, Python, GCP, dashboards, supply chain analytics, logistics, warehouse optimization."
-        ])
+    def test_rate_job_fit_penalizes_only_profile_extracted_gaps(self):
+        profile = {
+            "target_roles": ["Orbital Bakery Operations Analyst"],
+            "technical_skills": ["yeast robotics"],
+            "weaknesses_or_gaps": ["marine diesel repair"],
+            "seniority": {"years_experience": 2},
+        }
         job = NormalizedJob(
             company_name="Example",
             source="manual",
-            source_job_id="backend-lead",
+            source_job_id="profile-gap",
             requisition_id=None,
-            title="Tech Lead, Infrastructure Delivery Platform",
-            location="Tokyo, Japan",
+            title="Marine Diesel Repair Lead",
+            location="Remote",
             remote_type=None,
-            department="Engineering",
+            department="Operations",
             employment_type=None,
             salary_min=None,
             salary_max=None,
@@ -243,7 +260,7 @@ class Phase0Tests(unittest.TestCase):
             job_url="https://example.com/job",
             apply_url="https://example.com/apply",
             description_raw_html="",
-            description_text="Java backend engineering, microservices, system architecture, engineering team leadership, 5+ years production software development, Japanese fluency required.",
+            description_text="Marine diesel repair leadership role requiring 6+ years of experience.",
             posted_at=None,
         )
 
@@ -251,8 +268,8 @@ class Phase0Tests(unittest.TestCase):
 
         self.assertLess(rating["overall_score"], 6.0)
         self.assertEqual(rating["recommendation"], "Skip or very low priority")
-        self.assertIn("java backend", " ".join(rating["gaps"]).lower())
-        self.assertIn("japanese fluency", " ".join(rating["gaps"]).lower())
+        self.assertIn("marine diesel repair", " ".join(rating["gaps"]).lower())
+        self.assertIn("requires 6+ years", " ".join(rating["gaps"]).lower())
         self.assertLess(rating["practical_fit_score"], rating["skill_fit_score"])
 
     def test_dashboard_renders_upload_and_llm_extract_only_controls(self):
@@ -277,13 +294,13 @@ class Phase0Tests(unittest.TestCase):
             db.init()
             db.upload_resume_file(
                 "resume.txt",
-                b"Google Control Tower dashboards for supply chain capacity. Tesla warehouse optimization. MS Data Science. SQL Python forecasting.",
+                b"Custom orbital bakery program managed sourdough telemetry and yeast robotics for 4+ years.",
                 "text/plain",
             )
             db.extract_profile_from_active_resumes()
             html = render_profile_section(db)
-            self.assertIn("Proof points", html)
-            self.assertIn("google_control_tower", html)
+            self.assertIn("Skills", html)
+            self.assertIn("sourdough", html)
             self.assertIn("Target directions", html)
             self.assertIn("Experience baseline", html)
 
@@ -303,6 +320,26 @@ class Phase0Tests(unittest.TestCase):
                 self.assertEqual(os.environ["JOBSEARCH_LLM_MODEL"], "dotenv-model")
                 self.assertEqual(os.environ["OPENAI_API_KEY"], "existing-key")
 
+    def test_environment_loader_uses_project_env_then_hermes_env_fallback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root_env = Path(tmp) / "project.env"
+            hermes_env = Path(tmp) / "hermes.env"
+            root_env.write_text(
+                "JOBSEARCH_LLM_MODEL=project-model\n"
+                "JOBSEARCH_LLM_API_KEY=project-key\n",
+                encoding="utf-8",
+            )
+            hermes_env.write_text(
+                "OPENROUTER_API_KEY=hermes-openrouter-key\n"
+                "JOBSEARCH_LLM_MODEL=hermes-should-not-override\n",
+                encoding="utf-8",
+            )
+            with patch.dict("os.environ", {}, clear=True):
+                load_environment_files(root_env=root_env, hermes_env=hermes_env)
+                self.assertEqual(os.environ["JOBSEARCH_LLM_MODEL"], "project-model")
+                self.assertEqual(os.environ["JOBSEARCH_LLM_API_KEY"], "project-key")
+                self.assertEqual(os.environ["OPENROUTER_API_KEY"], "hermes-openrouter-key")
+
     def test_openai_compatible_json_client_sends_json_mode_request(self):
         fake_response = MagicMock()
         fake_response.read.return_value = json.dumps({"choices": [{"message": {"content": json.dumps({"ok": True})}}]}).encode("utf-8")
@@ -319,6 +356,23 @@ class Phase0Tests(unittest.TestCase):
         self.assertEqual(payload["model"], "unit-model")
         self.assertEqual(payload["response_format"], {"type": "json_object"})
         self.assertEqual(request.headers["Authorization"], "Bearer test-key")
+
+    def test_deepseek_v4_flash_openrouter_client_uses_openrouter_key_base_and_model(self):
+        fake_response = MagicMock()
+        fake_response.read.return_value = json.dumps({"choices": [{"message": {"content": json.dumps({"bucket": "gte_7"})}}]}).encode("utf-8")
+        fake_cm = MagicMock()
+        fake_cm.__enter__.return_value = fake_response
+
+        with patch.dict("os.environ", {"OPENROUTER_API_KEY": "or-key", "JOBSEARCH_LLM_API_KEY": "normal-key"}, clear=True):
+            with patch("jobsearch.app.urllib.request.urlopen", return_value=fake_cm) as urlopen:
+                result = deepseek_v4_flash_openrouter_client("system", "user")
+
+        self.assertEqual(result, {"bucket": "gte_7"})
+        request = urlopen.call_args.args[0]
+        self.assertEqual(request.full_url, "https://openrouter.ai/api/v1/chat/completions")
+        payload = json.loads(request.data.decode("utf-8"))
+        self.assertEqual(payload["model"], "deepseek/deepseek-v4-flash")
+        self.assertEqual(request.headers["Authorization"], "Bearer or-key")
 
     def test_llm_profile_extraction_stores_comprehensive_profile_and_provenance(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -429,6 +483,351 @@ class Phase0Tests(unittest.TestCase):
             self.assertEqual(second["rated"], 2)
             self.assertEqual(fake_llm.call_count, 2)
             self.assertEqual(db.conn.execute("SELECT COUNT(*) FROM job_ratings").fetchone()[0], 2)
+
+    def test_fast_llm_rating_persists_resume_driven_bucket_and_rating_status_filter(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Database(Path(tmp) / "jobs.sqlite")
+            db.init()
+            db.upload_resume_file("resume.txt", b"Custom role evidence: underwater basket weaving Python", "text/plain")
+            db.extract_llm_profile_from_active_resumes(
+                MagicMock(return_value={"candidate_summary": "custom candidate", "target_roles": ["Underwater Basket Weaver"], "technical_skills": ["Python"]}),
+                model_name="test-model",
+            )
+            company = db.companies("databricks")[0]
+            _, _, ids = db.upsert_jobs(company, [NormalizedJob(
+                company_name="Databricks", source="manual", source_job_id="fast-rating-1", requisition_id=None,
+                title="Underwater Basket Weaver", location="California", remote_type=None, department="Operations",
+                employment_type=None, salary_min=None, salary_max=None, currency=None, job_url="https://example.com/job/fast",
+                apply_url="https://example.com/apply/fast", description_raw_html="", description_text="Weave baskets underwater using Python automation.",
+                posted_at=None,
+            )], refresh_mode="search")
+            fake_llm = MagicMock(return_value={
+                "bucket": "gte_7",
+                "confidence": "high",
+                "reason_codes": ["resume_target_role_match"],
+                "short_reason": "Matches the extracted target role.",
+            })
+
+            row = db.fast_rate_job_with_llm(ids[0], fake_llm, model_name="test-model")
+            rows, total, *_ = query_jobs_from_db(db, {"rating_status": ["fast_rated"]})
+
+            self.assertEqual(row["bucket"], "gte_7")
+            self.assertEqual(fast_rating_bucket_label(row["bucket"]), ">=7 fast pass")
+            self.assertEqual(total, 1)
+            self.assertEqual(rows[0]["id"], ids[0])
+            self.assertIn("Underwater Basket Weaver", fake_llm.call_args.kwargs["user_prompt"])
+            self.assertIn("Prefer false positives over false negatives", fake_llm.call_args.kwargs["user_prompt"])
+            self.assertIn("choose lt_7 only when", fake_llm.call_args.kwargs["user_prompt"])
+            self.assertIn("uncertain but promising", fake_llm.call_args.kwargs["user_prompt"])
+            prompt = fake_llm.call_args.kwargs["user_prompt"]
+            self.assertIn("DeepSeek/cheap fast models can be over-strict", prompt)
+            self.assertIn("Profile-agnostic decision examples", prompt)
+            self.assertIn("extracted target role", prompt)
+            self.assertIn("extracted transferable skill", prompt)
+            self.assertIn("Do not use lt_7 for merely imperfect matches", prompt)
+            self.assertNotIn("Supply Chain Program Manager", prompt)
+            self.assertNotIn("SQL/Python", prompt)
+            self.assertNotIn("Google Control Tower", prompt)
+            self.assertEqual(FAST_RATING_PROMPT_VERSION, "llm-fast-rating-v5")
+
+    def test_rating_status_filter_separates_unrated_fast_manual_and_deep_states(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Database(Path(tmp) / "jobs.sqlite")
+            db.init()
+            db.upload_resume_file("resume.txt", b"SQL Python analytics", "text/plain")
+            db.extract_llm_profile_from_active_resumes(MagicMock(return_value={"candidate_summary": "analytics", "target_roles": ["analyst"]}), model_name="test-model")
+            company = db.companies("databricks")[0]
+            jobs = [NormalizedJob(
+                company_name="Databricks", source="manual", source_job_id=f"rating-state-{i}", requisition_id=None,
+                title=f"Data Analyst {i}", location="California", remote_type=None, department="Operations",
+                employment_type=None, salary_min=None, salary_max=None, currency=None, job_url=f"https://example.com/job/state/{i}",
+                apply_url=f"https://example.com/apply/state/{i}", description_raw_html="", description_text="SQL Python analytics",
+                posted_at=None,
+            ) for i in range(4)]
+            _, _, ids = db.upsert_jobs(company, jobs, refresh_mode="search")
+            db.fast_rate_job_with_llm(ids[1], MagicMock(return_value={"bucket": "gte_7", "confidence": "medium", "reason_codes": [], "short_reason": "Plausible."}), model_name="test-model")
+            db.fast_rate_job_with_llm(ids[2], MagicMock(return_value={"bucket": "needs_manual_review", "confidence": "low", "reason_codes": [], "short_reason": "Ambiguous."}), model_name="test-model")
+            db.rate_job_with_llm(ids[3], MagicMock(return_value={
+                "overall_score": 8.4, "skill_fit_score": 8.4, "practical_fit_score": 8.4,
+                "recommendation": "Good fit", "categories": {}, "strongest_evidence": [], "main_gaps": [],
+                "practical_notes": [], "resume_tailoring_notes": [], "interview_probability_reasoning": "", "apply_decision": "apply",
+            }), model_name="test-model")
+
+            def filtered(status):
+                return {row["id"] for row in query_jobs_from_db(db, {"rating_status": [status]})[0]}
+
+            self.assertEqual(filtered("unrated"), {ids[0]})
+            self.assertEqual(filtered("fast_rated"), {ids[1]})
+            self.assertEqual(filtered("needs_manual_review"), {ids[2]})
+            self.assertEqual(filtered("deep_rated"), {ids[3]})
+
+    def test_benchmark_fast_rating_defaults_to_dry_run_without_database_writes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "jobs.sqlite"
+            db = Database(db_path)
+            db.init()
+            db.upload_resume_file("resume.txt", b"SQL Python analytics", "text/plain")
+            db.extract_llm_profile_from_active_resumes(
+                MagicMock(return_value={"candidate_summary": "analytics", "target_roles": ["analyst"], "technical_skills": ["SQL", "Python"]}),
+                model_name="test-model",
+            )
+            company = db.companies("databricks")[0]
+            _, _, ids = db.upsert_jobs(company, [NormalizedJob(
+                company_name="Databricks", source="manual", source_job_id="dry-bench-1", requisition_id=None,
+                title="Data Analyst", location="California", remote_type=None, department="Operations",
+                employment_type=None, salary_min=None, salary_max=None, currency=None, job_url="https://example.com/job/dry-bench",
+                apply_url="https://example.com/apply/dry-bench", description_raw_html="", description_text="SQL Python analytics",
+                posted_at=None,
+            )], refresh_mode="search")
+            db.conn.close()
+            fake_llm = MagicMock(return_value={
+                "bucket": "gte_7",
+                "confidence": "high",
+                "reason_codes": ["profile_match"],
+                "short_reason": "Strong analytics match.",
+            })
+
+            result = benchmark_fast_rating(sample_size=100, db_path=db_path, llm_client=fake_llm, model_name="test-model")
+
+            verify_db = Database(db_path)
+            verify_db.init()
+            self.assertEqual(result["dry_run"], True)
+            self.assertEqual(result["rated"], 1)
+            self.assertEqual(result["bucket_counts"], {"gte_7": 1})
+            self.assertEqual(verify_db.conn.execute("SELECT COUNT(*) FROM job_fast_ratings").fetchone()[0], 0)
+            rows, total, *_ = query_jobs_from_db(verify_db, {"rating_status": ["unrated"]})
+            self.assertEqual(total, 1)
+            self.assertEqual(rows[0]["id"], ids[0])
+
+    def test_benchmark_fast_rating_save_option_persists_results(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "jobs.sqlite"
+            db = Database(db_path)
+            db.init()
+            db.upload_resume_file("resume.txt", b"SQL Python analytics", "text/plain")
+            db.extract_llm_profile_from_active_resumes(
+                MagicMock(return_value={"candidate_summary": "analytics", "target_roles": ["analyst"], "technical_skills": ["SQL", "Python"]}),
+                model_name="test-model",
+            )
+            company = db.companies("databricks")[0]
+            db.upsert_jobs(company, [NormalizedJob(
+                company_name="Databricks", source="manual", source_job_id="save-bench-1", requisition_id=None,
+                title="Data Analyst", location="California", remote_type=None, department="Operations",
+                employment_type=None, salary_min=None, salary_max=None, currency=None, job_url="https://example.com/job/save-bench",
+                apply_url="https://example.com/apply/save-bench", description_raw_html="", description_text="SQL Python analytics",
+                posted_at=None,
+            )], refresh_mode="search")
+            db.conn.close()
+            fake_llm = MagicMock(return_value={
+                "bucket": "gte_7",
+                "confidence": "high",
+                "reason_codes": ["profile_match"],
+                "short_reason": "Strong analytics match.",
+            })
+
+            result = benchmark_fast_rating(sample_size=100, db_path=db_path, llm_client=fake_llm, model_name="test-model", save=True)
+
+            verify_db = Database(db_path)
+            verify_db.init()
+            self.assertEqual(result["dry_run"], False)
+            self.assertEqual(result["rated"], 1)
+            self.assertEqual(result["bucket_counts"], {"gte_7": 1})
+            self.assertEqual(verify_db.conn.execute("SELECT COUNT(*) FROM job_fast_ratings").fetchone()[0], 1)
+
+    def test_compare_fast_vs_deep_rating_dry_run_reports_confusion_metrics_without_writes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "jobs.sqlite"
+            db = Database(db_path)
+            db.init()
+            db.upload_resume_file("resume.txt", b"SQL Python analytics", "text/plain")
+            db.extract_llm_profile_from_active_resumes(
+                MagicMock(return_value={"candidate_summary": "analytics", "target_roles": ["analyst"], "technical_skills": ["SQL", "Python"]}),
+                model_name="test-model",
+            )
+            company = db.companies("databricks")[0]
+            db.upsert_jobs(company, [
+                NormalizedJob(
+                    company_name="Databricks", source="manual", source_job_id="compare-strong", requisition_id=None,
+                    title="Data Analyst", location="California", remote_type=None, department="Operations",
+                    employment_type=None, salary_min=None, salary_max=None, currency=None, job_url="https://example.com/job/compare-strong",
+                    apply_url="https://example.com/apply/compare-strong", description_raw_html="", description_text="SQL Python analytics",
+                    posted_at=None,
+                ),
+                NormalizedJob(
+                    company_name="Databricks", source="manual", source_job_id="compare-weak", requisition_id=None,
+                    title="Java Architect", location="California", remote_type=None, department="Engineering",
+                    employment_type=None, salary_min=None, salary_max=None, currency=None, job_url="https://example.com/job/compare-weak",
+                    apply_url="https://example.com/apply/compare-weak", description_raw_html="", description_text="Java architecture",
+                    posted_at=None,
+                ),
+                NormalizedJob(
+                    company_name="Databricks", source="manual", source_job_id="compare-fn", requisition_id=None,
+                    title="Solutions Engineer", location="California", remote_type=None, department="Field Engineering",
+                    employment_type=None, salary_min=None, salary_max=None, currency=None, job_url="https://example.com/job/compare-fn",
+                    apply_url="https://example.com/apply/compare-fn", description_raw_html="", description_text="Technical customer-facing SQL analytics solutions work",
+                    posted_at=None,
+                ),
+            ], refresh_mode="search")
+            db.conn.close()
+
+            fast_models_seen = []
+            deep_models_seen = []
+
+            def fake_fast(**kwargs):
+                fast_models_seen.append(kwargs["model_name"])
+                if '"title": "Data Analyst"' in kwargs["user_prompt"]:
+                    bucket = "gte_7"
+                elif '"title": "Solutions Engineer"' in kwargs["user_prompt"]:
+                    bucket = "lt_7"
+                else:
+                    bucket = "needs_manual_review"
+                return {"bucket": bucket, "confidence": "high", "reason_codes": [], "short_reason": "test"}
+
+            def fake_deep(**kwargs):
+                deep_models_seen.append(kwargs["model_name"])
+                if '"title": "Data Analyst"' in kwargs["user_prompt"]:
+                    score = 8.2
+                elif '"title": "Solutions Engineer"' in kwargs["user_prompt"]:
+                    score = 7.8
+                else:
+                    score = 5.5
+                return {
+                    "overall_score": score,
+                    "skill_fit_score": score,
+                    "practical_fit_score": score,
+                    "recommendation": "test",
+                    "categories": {},
+                    "strongest_evidence": [],
+                    "main_gaps": [],
+                    "practical_notes": [],
+                    "resume_tailoring_notes": [],
+                    "interview_probability_reasoning": "test",
+                    "apply_decision": "test",
+                }
+
+            result = compare_fast_vs_deep_rating(
+                sample_size=10,
+                db_path=db_path,
+                fast_llm_client=fake_fast,
+                deep_llm_client=fake_deep,
+                fast_model_name="fast-test-model",
+                deep_model_name="deep-test-model",
+            )
+
+            verify_db = Database(db_path)
+            verify_db.init()
+            self.assertTrue(result["dry_run"])
+            self.assertEqual(result["compared"], 3)
+            self.assertEqual(result["confusion_matrix"]["true_positive"], 1)
+            self.assertEqual(result["confusion_matrix"]["manual_review"], 1)
+            self.assertEqual(result["confusion_matrix"]["false_negative"], 1)
+            self.assertEqual(result["recall"], 0.5)
+            self.assertEqual(result["precision"], 1.0)
+            self.assertEqual(result["fast_model_name"], "fast-test-model")
+            self.assertEqual(result["deep_model_name"], "deep-test-model")
+            self.assertEqual(set(fast_models_seen), {"fast-test-model"})
+            self.assertEqual(set(deep_models_seen), {"deep-test-model"})
+            self.assertEqual(result["manual_reviews"], [{
+                "job_id": next(example["job_id"] for example in result["examples"] if example["title"] == "Java Architect"),
+                "title": "Java Architect",
+                "company": "Databricks",
+                "fast_bucket": "needs_manual_review",
+                "deep_score": 5.5,
+                "outcome": "manual_review",
+            }])
+            self.assertEqual(result["false_negatives"], [{
+                "job_id": next(example["job_id"] for example in result["examples"] if example["title"] == "Solutions Engineer"),
+                "title": "Solutions Engineer",
+                "company": "Databricks",
+                "fast_bucket": "lt_7",
+                "deep_score": 7.8,
+                "outcome": "false_negative",
+            }])
+            self.assertEqual(verify_db.conn.execute("SELECT COUNT(*) FROM job_fast_ratings").fetchone()[0], 0)
+            self.assertEqual(verify_db.conn.execute("SELECT COUNT(*) FROM job_ratings").fetchone()[0], 0)
+
+    def test_compare_rating_models_runs_deep_default_fast_and_openrouter_fast_on_same_sample(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "jobs.sqlite"
+            db = Database(db_path)
+            db.init()
+            db.upload_resume_file("resume.txt", b"SQL Python analytics", "text/plain")
+            db.extract_llm_profile_from_active_resumes(
+                MagicMock(return_value={"candidate_summary": "analytics", "target_roles": ["analyst"], "technical_skills": ["SQL", "Python"]}),
+                model_name="test-model",
+            )
+            company = db.companies("databricks")[0]
+            db.upsert_jobs(company, [
+                NormalizedJob(
+                    company_name="Databricks", source="manual", source_job_id="models-strong", requisition_id=None,
+                    title="Data Analyst", location="California", remote_type=None, department="Data",
+                    employment_type=None, salary_min=None, salary_max=None, currency=None, job_url="https://example.com/job/models-strong",
+                    apply_url="https://example.com/apply/models-strong", description_raw_html="", description_text="SQL Python analytics",
+                    posted_at=None,
+                ),
+                NormalizedJob(
+                    company_name="Databricks", source="manual", source_job_id="models-miss", requisition_id=None,
+                    title="Solutions Engineer", location="California", remote_type=None, department="Field Engineering",
+                    employment_type=None, salary_min=None, salary_max=None, currency=None, job_url="https://example.com/job/models-miss",
+                    apply_url="https://example.com/apply/models-miss", description_raw_html="", description_text="Technical customer-facing SQL analytics solutions work",
+                    posted_at=None,
+                ),
+            ], refresh_mode="search")
+            db.conn.close()
+
+            calls = []
+
+            def fake_deep(**kwargs):
+                calls.append(("deep", kwargs["model_name"]))
+                score = 8.2 if '"title": "Data Analyst"' in kwargs["user_prompt"] else 7.8
+                return {
+                    "overall_score": score,
+                    "skill_fit_score": score,
+                    "practical_fit_score": score,
+                    "recommendation": "test",
+                    "categories": {},
+                    "strongest_evidence": [],
+                    "main_gaps": [],
+                    "practical_notes": [],
+                    "resume_tailoring_notes": [],
+                    "interview_probability_reasoning": "test",
+                    "apply_decision": "test",
+                }
+
+            def fake_default_fast(**kwargs):
+                calls.append(("default_fast", kwargs["model_name"]))
+                bucket = "gte_7" if '"title": "Data Analyst"' in kwargs["user_prompt"] else "lt_7"
+                return {"bucket": bucket, "confidence": "high", "reason_codes": [], "short_reason": "test"}
+
+            def fake_openrouter_fast(**kwargs):
+                calls.append(("openrouter_fast", kwargs["model_name"]))
+                return {"bucket": "gte_7", "confidence": "high", "reason_codes": [], "short_reason": "test"}
+
+            result = compare_rating_models(
+                sample_size=10,
+                db_path=db_path,
+                deep_llm_client=fake_deep,
+                default_fast_llm_client=fake_default_fast,
+                openrouter_fast_llm_client=fake_openrouter_fast,
+                deep_model_name="deep-test-model",
+                default_fast_model_name="deep-test-model",
+                openrouter_fast_model_name="deepseek/deepseek-v4-flash",
+            )
+
+            verify_db = Database(db_path)
+            verify_db.init()
+            self.assertTrue(result["dry_run"])
+            self.assertEqual(result["compared"], 2)
+            self.assertEqual(result["deep_model_name"], "deep-test-model")
+            self.assertEqual(result["fast_models"]["previous_fast"]["model_name"], "deep-test-model")
+            self.assertEqual(result["fast_models"]["openrouter_v4_flash"]["model_name"], "deepseek/deepseek-v4-flash")
+            self.assertEqual(result["fast_models"]["previous_fast"]["confusion_matrix"]["false_negative"], 1)
+            self.assertEqual(result["fast_models"]["previous_fast"]["recall"], 0.5)
+            self.assertEqual(result["fast_models"]["openrouter_v4_flash"]["confusion_matrix"]["true_positive"], 2)
+            self.assertEqual(result["fast_models"]["openrouter_v4_flash"]["recall"], 1.0)
+            self.assertEqual({kind for kind, _ in calls}, {"deep", "default_fast", "openrouter_fast"})
+            self.assertEqual(verify_db.conn.execute("SELECT COUNT(*) FROM job_fast_ratings").fetchone()[0], 0)
+            self.assertEqual(verify_db.conn.execute("SELECT COUNT(*) FROM job_ratings").fetchone()[0], 0)
 
     def test_llm_rating_recommendation_is_normalized_to_score_band(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -562,11 +961,46 @@ class Phase0Tests(unittest.TestCase):
         self.assertIn("Rated 2 of 2 jobs", job["message"])
         reset_background_jobs_for_tests()
 
+    def test_fast_rating_background_returns_before_rating_finishes(self):
+        reset_background_jobs_for_tests()
+        started = threading.Event()
+        release = threading.Event()
+        finished = threading.Event()
+
+        def slow_runner(_db, _job_ids):
+            started.set()
+            release.wait(timeout=2)
+            finished.set()
+            return {"requested": 2, "rated": 2, "failed": 0}
+
+        start = time.monotonic()
+        job = start_llm_fast_rating_background(Path("/tmp/unused.sqlite"), [1, 2], runner=slow_runner)
+        elapsed = time.monotonic() - start
+
+        self.assertLess(elapsed, 0.2)
+        self.assertEqual(job["status"], "running")
+        self.assertTrue(started.wait(timeout=1))
+        self.assertFalse(finished.is_set())
+
+        release.set()
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            job = background_job_snapshot("llm_fast_rating") or job
+            if job["status"] == "succeeded":
+                break
+            time.sleep(0.01)
+        self.assertEqual(job["status"], "succeeded")
+        self.assertIn("Fast-rated 2 of 2 jobs", job["message"])
+        reset_background_jobs_for_tests()
+
     def test_dashboard_renders_bulk_rating_buttons(self):
         html = render_bulk_rating_controls({"q": ["analyst"], "company": ["databricks"], "page": ["2"]}, [10, 11], "/?q=analyst&company=databricks&page=2")
 
-        self.assertIn("Rate all matching jobs with LLM", html)
-        self.assertIn("Rate jobs on this page with LLM", html)
+        self.assertIn("Fast rate unrated matching jobs", html)
+        self.assertIn("Fast rate unrated jobs on this page", html)
+        self.assertIn("Deep rate fast-rated &gt;=7 matching jobs", html)
+        self.assertIn("Deep rate all matching jobs with LLM", html)
+        self.assertIn("Deep rate jobs on this page with LLM", html)
         self.assertIn('name="scope" value="all"', html)
         self.assertIn('name="scope" value="page"', html)
         self.assertIn('name="job_id" value="10"', html)

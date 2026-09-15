@@ -1,15 +1,42 @@
 # Phase 0 BRD — Automated Job Sourcing Pipeline
 
+## Project Pause Status
+
+**Status:** paused / maintenance-only as of 2026-09-14 because the user has finished the current job search.
+
+This document is the canonical current-state BRD for the repository at pause time. The app should be treated as a working local-first checkpoint that can be resumed for a future search. Future work should prioritize preservation, reproducibility, and low-risk maintenance over new feature expansion unless the project is explicitly restarted.
+
 ## 1. Business Objective
 
-Build the first version of a local-first job-search application that automatically pulls jobs from selected company career sites, normalizes them into a common schema, stores them, and displays them in a dashboard for manual review and later LLM-based scoring.
+Build a local-first job-search application that pulls jobs from selected company career sites, normalizes them into a common schema, stores them in SQLite, and displays them in a dashboard for review, resume/profile management, and explicitly-triggered LLM fit rating.
 
 Initial companies:
 
 - Databricks
 - NVIDIA
 
-Phase 0 does **not** perform fit scoring, resume tailoring, or application submission. It creates the job data pipeline and review surface that later phases will use.
+Phase 0 began as the ingestion/review surface. The current app has grown to include resume/profile upload, LLM profile extraction, deep LLM job rating, fast LLM pre-rating infrastructure, and rating comparison CLI tools. Resume tailoring and application submission remain out of scope.
+
+## 1.1 Current Implementation Snapshot
+
+Repository layout:
+
+- `jobsearch/app.py`: single-file Python app containing environment loading, background jobs, connectors, SQLite migrations/data access, resume/profile/rating logic, dashboard rendering, HTTP handlers, and CLI commands.
+- `tests/test_phase0.py`: regression tests for ingestion, DB state transitions, dashboard rendering, LLM profile/rating flows, fast/deep rating, and model comparison helpers.
+- `data/jobs.sqlite`: local SQLite database.
+- `data/resumes/`: uploaded resume files.
+- `docs/brd/`: markdown and Word BRDs.
+- `.env`: gitignored local secrets/config. `.env.example` documents required variables.
+
+Live local database state as of latest inspection on 2026-09-14:
+
+- `jobs`: 6,417 rows.
+- `job_ratings`: 3,039 deep ratings, all stored with `model_name='gpt-4o-mini'`.
+- `job_fast_ratings`: 0 persisted rows.
+- `profile_extractions`: 8 rows, including 1 LLM profile extraction with `gpt-4o-mini`.
+- `resume_files`: 9 rows.
+- `job_fetch_runs`: 205 rows.
+- `job_ingestion_audits`: 164,535 rows.
 
 ## 2. Background
 
@@ -41,12 +68,11 @@ For the rating approach, the product starts with direct LLM scoring and is desig
 
 ### Out of scope
 
-- LLM fit scoring.
 - Resume tailoring.
 - Cover-letter generation.
-- User profile/resume management.
 - Browser automation or application submission.
 - Scraping LinkedIn, Indeed, or Google Jobs.
+- Making DeepSeek the dashboard fast-rating model before validation proves it is on par with `gpt-4o-mini` for recall-safe fast rating.
 
 ## 4. Source Strategy
 
@@ -273,6 +299,50 @@ Audit behavior:
 - The main dashboard should display compact warning badges only when the latest audit has warnings.
 - The job detail page should display a full ingestion audit section with required missing fields, optional missing fields, warnings, description length, location status, detail fetch status, and raw snapshot availability.
 
+
+#### `job_ratings`
+
+Stores deep/full LLM ratings. Current persisted deep ratings use `model_name='gpt-4o-mini'`.
+
+Fields:
+
+- `id`
+- `job_id`
+- `profile_extraction_id`
+- `profile_hash`
+- `job_content_hash`
+- `rubric_version`
+- `rater_version`
+- `model_name`
+- `overall_score`
+- `skill_fit_score`
+- `practical_fit_score`
+- `recommendation`
+- `rating_json`
+- `is_current`
+- `created_at`
+
+#### `job_fast_ratings`
+
+Stores recall-heavy fast pre-rating results separately from deep ratings. No fast ratings are currently persisted in the live DB.
+
+Fields:
+
+- `id`
+- `job_id`
+- `profile_extraction_id`
+- `profile_hash`
+- `job_content_hash`
+- `rater_version`
+- `model_name`
+- `bucket` (`gte_7`, `lt_7`, `needs_manual_review`)
+- `confidence`
+- `reason_codes_json`
+- `short_reason`
+- `rating_json`
+- `is_current`
+- `created_at`
+
 ## 6. Normalized Job Schema
 
 All connectors should produce this shape before database upsert:
@@ -366,25 +436,26 @@ The UI should support a local resume/profile area before rating is implemented:
 
 Profile extraction and job rating should follow the user-provided reference model: ratings estimate expected interview probability plus role fit, not title similarity alone.
 
-The profile extractor should preserve structured evidence that can support ratings and tailoring:
+The profile extractor should preserve structured evidence that can support ratings and tailoring. These fields must be populated only from the current uploaded resume text and current LLM extraction result, not from hardcoded candidate assumptions:
 
-- Target directions: tech supply chain, TPM, analytics, infrastructure, China/US/global exposure, and management track.
-- Strong proof points from the resume/reference: Google Control Tower, Tesla warehouse optimization, Industrial Engineering + MS Data Science, Enron ML, and Malema internship when present.
-- Domains/background: manufacturing, PCBA, supply chain, logistics, capacity, warehouse optimization, data analytics, forecasting, operations, quality/process/SOP work.
-- Tools/technical signals: SQL, Python, GCP, dashboards, optimization, ML, forecasting, BI tools, WMS/OMS, OR/analytics tooling.
-- Practical fit signals and blockers when available: internships/current-enrollment requirements, work authorization/location constraints, language requirements, years/seniority mismatches, and hard technical-lead requirements outside the resume evidence.
+- Target roles/directions extracted from the resume/profile.
+- Target industries/domains extracted from the resume/profile.
+- Technical/tool skills extracted from the resume/profile.
+- Core strengths and proof points extracted from the resume/profile.
+- Weaknesses, gaps, seniority, and practical constraints extracted from the resume/profile.
+- Resume bullet inventory/evidence extracted from the resume/profile.
 
-Fit scoring should return an overall 0-10 score plus category-level scores/reasons using these weights:
+Fit scoring should return an overall 0-10 score plus category-level scores/reasons using these weights. All category matching must compare the current job only against fields in the extracted profile JSON; rating code/prompts must not introduce hardcoded candidate roles, domains, companies, tools, proof points, or examples.
 
 | Category | Weight | Meaning |
 | --- | ---: | --- |
-| Core job-function match | 30% | Whether the job asks for work the user has done: analytics, planning, TPM, sourcing, logistics, ML, operations leadership, etc. |
-| Experience/seniority match | 20% | Whether years/seniority fit the user's 3+ years Accenture/Google + MSDS profile. |
-| Domain match | 15% | Whether the job connects to manufacturing, PCBA, supply chain, logistics, capacity, warehouse optimization, or data analytics. |
-| Technical/tool match | 15% | Match on SQL, Python, GCP, dashboards, optimization, ML, forecasting, BI tools, WMS/OMS, etc. |
-| Evidence strength from resume | 10% | Whether strong bullets/projects can prove the match, e.g. Google Control Tower, Tesla warehouse optimization, Enron ML, Malema internship. |
-| Gap severity | 5% | Whether gaps are small/trainable or hard blockers like Java backend tech lead, Japanese fluency, UK work authorization, or 10 years direct leadership. |
-| Strategic career value | 5% | Whether the role moves toward tech supply chain, TPM, analytics, infrastructure, China/US/global exposure, or management track. |
+| Core job-function match | 30% | Whether the job asks for work represented in extracted target roles, strengths, skills, domains, and proof points. |
+| Experience/seniority match | 20% | Whether years/seniority requirements align with seniority evidence in the extracted profile. |
+| Domain match | 15% | Whether the job connects to extracted target industries/domains. |
+| Technical/tool match | 15% | Whether job requirements match extracted technical/tool skills. |
+| Evidence strength from resume | 10% | Whether extracted proof points or resume bullet inventory can prove the match. |
+| Gap severity | 5% | Whether extracted gaps/practical constraints conflict with job requirements. |
+| Strategic career value | 5% | Whether the role moves toward extracted target roles/directions. |
 
 Score interpretation:
 
@@ -399,9 +470,10 @@ The rating output should distinguish skill fit from practical fit when practical
 
 LLM extraction/rating implementation requirements:
 
-- Add an OpenAI-compatible chat-completions client configured by environment variables: `JOBSEARCH_LLM_API_KEY` or `OPENAI_API_KEY`, optional `JOBSEARCH_LLM_BASE_URL`, and optional `JOBSEARCH_LLM_MODEL`. The local app should also auto-load a gitignored project-root `.env` file for these settings so the user can configure LLM features without exporting shell variables each launch.
+- Add an OpenAI-compatible chat-completions client configured by environment variables: `JOBSEARCH_LLM_API_KEY` or `OPENAI_API_KEY`, optional `JOBSEARCH_LLM_BASE_URL`, and optional `JOBSEARCH_LLM_MODEL`. The app loads project-root `.env` first and then falls back to the Hermes `.env` for missing shared keys such as `OPENROUTER_API_KEY`.
+- Current local config has `JOBSEARCH_LLM_MODEL=gpt-4o-mini` and no `JOBSEARCH_LLM_BASE_URL`, so deep/profile/default rating calls go directly to OpenAI's `https://api.openai.com/v1/chat/completions` using `JOBSEARCH_LLM_API_KEY`, not OpenRouter.
 - Keep the local extractor as a no-token fallback/debug option in code/tests, but do not expose it as a dashboard action. The dashboard should expose a clearly-labeled `Extract/update profile with LLM` button for the comprehensive profile.
-- LLM profile extraction input should include active resume extracted text plus the user's reference rubric. Output must be strict JSON following the profile schema, including candidate summary, target roles, target industries, seniority, core strengths, technical skills, domain skills, proof points, weaknesses/gaps, practical constraints, and resume bullet inventory.
+- LLM profile extraction input should include active resume extracted text plus the profile/rating schema and generic 7-category rubric. Output must be strict JSON following the profile schema, including candidate summary, target roles, target industries, seniority, core strengths, technical skills, domain skills, proof points, weaknesses/gaps, practical constraints, and resume bullet inventory. The prompt/rubric must not include hardcoded candidate-specific roles, domains, companies, tools, proof points, or examples; these must come only from the uploaded resume text and extracted profile JSON.
 - Add `profile_extractions.extraction_method`, `model_name`, and `prompt_version` columns when absent. LLM profile rows should use an extractor version such as `llm-profile-v1` and method `llm`.
 - Add a `job_ratings` table for cached ratings keyed by `job_id`, `profile_extraction_id`, `profile_hash`, `job_content_hash`, `rubric_version`, `rater_version`, and `model_name`.
 - The dashboard should expose `Rate this job with LLM` on job detail pages. Ratings should be manual; no automatic rating on refresh or page load.
@@ -410,7 +482,38 @@ LLM extraction/rating implementation requirements:
 - Rating output must be strict JSON with overall score, skill fit, practical fit, recommendation, category breakdown, strongest evidence, main gaps, practical notes, resume tailoring notes, interview probability reasoning, and apply decision.
 - Job cards should show a compact rating badge when a current rating exists. Job detail pages should show the detailed rating breakdown.
 - Cache controls: if a current rating exists for the same profile/job/rubric/model hash, reuse it unless the user explicitly re-rates.
-- Token control: all LLM actions are explicit button clicks; single-job rating is synchronous for now, while profile extraction starts a background job and immediately redirects so the browser does not sit in loading mode during long LLM calls. Batch rating is out of scope until single-job flow is verified.
+- Token control: all LLM actions are explicit button clicks. Profile extraction, deep bulk rating, and fast bulk rating run as background jobs and redirect immediately with visible status. Single-job deep rating remains manual from the job detail page.
+
+
+
+### Fast/deep rating model validation
+
+The product uses two rating concepts:
+
+- **Deep/full rating:** rigorous 7-category score stored in `job_ratings`; currently defaults to `gpt-4o-mini` via `JOBSEARCH_LLM_MODEL`.
+- **Fast pre-rating:** recall-heavy triage into `gte_7`, `lt_7`, or `needs_manual_review`, stored in `job_fast_ratings` when persisted.
+
+Model routing rules:
+
+- Default fast and deep rating both resolve through `configured_llm_model()`: `JOBSEARCH_LLM_MODEL`, then `OPENAI_MODEL`, then default `gpt-4o-mini`.
+- DeepSeek is available only for explicit CLI benchmarking/comparison through `--fast-mode openrouter-v4-flash`, which uses `deepseek/deepseek-v4-flash` through OpenRouter with `OPENROUTER_API_KEY`.
+- DeepSeek must not be wired into the dashboard fast-rating controls until validation shows it is on par with `gpt-4o-mini`, especially on false-negative/recall safety.
+- Fast prompt version `llm-fast-rating-v5` adds DeepSeek/cheap-model guardrails against over-strict rejection, profile-agnostic examples, and a rule not to use `lt_7` for merely imperfect but plausibly relevant matches. It also routes stretch seniority, international/onsite location, work authorization/clearance/language concerns, customer-facing variants, unfamiliar title wording, missing specialized subdomain experience, and adjacent data/platform/operations roles to `needs_manual_review` when the profile has any transferable bridge. It must use the current extracted profile JSON, not hardcoded current-profile terms.
+
+Validation commands:
+
+```bash
+python3 -m jobsearch.app benchmark-fast-rating --sample-size 100 --fast-mode openrouter-v4-flash
+python3 -m jobsearch.app compare-fast-deep-rating --sample-size 100 --fast-mode openrouter-v4-flash
+python3 -m jobsearch.app compare-rating-models --sample-size 100
+```
+
+Validation acceptance guidance:
+
+- False negatives should be zero or extremely rare and explainable.
+- Recall on deep-rated `>=7` jobs should be comparable to or better than `gpt-4o-mini` fast rating.
+- Higher false positives are acceptable because deep rating verifies promising jobs.
+- `needs_manual_review` is acceptable as an abstain bucket, but should not be so large that fast rating stops saving work.
 
 ### Filters/search
 
@@ -468,6 +571,9 @@ The detail page should show:
 - FR13: The system can rate jobs with the 7-category weighted rubric and return overall score, recommendation, category scores, evidence, gaps, strategic value, and practical-fit notes.
 - FR14: The system can manually run LLM profile extraction from active resumes/reference rubric using an OpenAI-compatible provider, store provenance, and show the comprehensive profile in the dashboard.
 - FR15: The system can manually rate an individual job with the latest active LLM profile, cache the result, and display compact/detail rating views in the dashboard.
+- FR16: The system can run deep bulk rating in the background with progress counts and cached-rating reuse.
+- FR17: The system can run fast recall-heavy pre-rating separately from deep rating and derive rating-state filters without changing review/source/saved/hidden state.
+- FR18: The CLI can benchmark default fast rating, compare fast vs deep rating, and compare default fast rating against DeepSeek v4 Flash fast rating without writing results unless `--save` is provided.
 
 ## 10. Non-Functional Requirements
 
@@ -490,11 +596,16 @@ Phase 0 is complete when:
 6. User can open a job detail page.
 7. Each job includes an official application URL.
 8. Fetch runs are logged in `job_fetch_runs`.
+9. Resume upload/removal and profile extraction preserve provenance and do not auto-spend LLM tokens.
+10. Deep ratings are cached by profile/job/rubric/model keys and shown on cards/detail pages.
+11. Fast/deep comparison commands report model names, threshold, confusion metrics, bucket counts, and false negatives.
 
 ## 12. Future Considerations
 
-- Add a scheduled refresh cron job.
+Because the project is paused, these are optional restart items rather than active commitments:
+
+- Add or maintain a scheduled refresh cron job.
 - Add company-source management in the UI.
 - Add Workday facet-based filtering.
-- Add scoring queue for Phase 1.
+- Add persistent rating-attempt logs and richer stall diagnostics.
 - Add RAG later for evidence-backed scoring and tailoring.
